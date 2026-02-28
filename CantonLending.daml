@@ -1091,7 +1091,7 @@ template CantonLendingService
               operator
               collateralType  = CTN_SMUSD
               totalDeposited  = totalShares2
-              depositCount    = length smusdCids
+              depositCount    = 1
               lastUpdatedAt   = now
             pure ()
 
@@ -1166,7 +1166,7 @@ template CantonLendingService
               operator
               collateralType  = CTN_SMUSDE
               totalDeposited  = totalShares3
-              depositCount    = length smusdeCids
+              depositCount    = 1
               lastUpdatedAt   = now
             pure ()
 

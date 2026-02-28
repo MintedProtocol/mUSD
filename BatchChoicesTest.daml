@@ -653,3 +653,123 @@ test_ETHPool_BatchUnstake_PartialRequest = script do
   assertMsg "e3 archived" (not (isSome check3))
 
   debug "✅ 14. ETHPool_BatchUnstake — partial request (150 of 300) accepted, all tokens archived"
+
+-- ============================================================
+-- 15. FORFEIT GOVERNANCE POLICY — ETHPool_BatchUnstake
+-- Dedicated test proving INTENTIONAL forfeit semantics:
+--   - All provided tokens are archived unconditionally.
+--   - User receives EXACTLY requestedMusd (no change, no partial return).
+--   - Excess shares are burned (service totalShares reduced by ALL provided,
+--     not just requestedMusd / sharePrice worth).
+-- ============================================================
+
+test_ETHPool_BatchUnstake_ForfeitGovPolicy : Script ()
+test_ETHPool_BatchUnstake_ForfeitGovPolicy = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  poolSvcCid <- createPoolService operator regCid
+
+  -- Stake 3 × 100 mUSD → 300 total shares at sharePrice 1.0
+  m1 <- mintMusd operator alice 100.0
+  m2 <- mintMusd operator alice 100.0
+  m3 <- mintMusd operator alice 100.0
+  (poolSvcCid2, e1) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid ETHPool_Stake with
+      user = alice; musdCid = m1; selectedTier = NoLock
+  (poolSvcCid3, e2) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid2 ETHPool_Stake with
+      user = alice; musdCid = m2; selectedTier = NoLock
+  (poolSvcCid4, e3) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid3 ETHPool_Stake with
+      user = alice; musdCid = m3; selectedTier = NoLock
+
+  -- Request only 150 mUSD from positions worth 300 mUSD combined.
+  -- FORFEIT POLICY: all 3 tokens are archived; user gets exactly 150 mUSD.
+  (poolSvcCid5, musdOut) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid4 ETHPool_BatchUnstake with
+      user          = alice
+      smusdeCids    = [e1, e2, e3]
+      requestedMusd = 150.0
+
+  -- 1. User receives EXACTLY requestedMusd — no over-withdrawal.
+  mOut <- queryContractId alice musdOut
+  assertMsg "Payout is exactly requestedMusd (150)" ((fromSome mOut).amount == 150.0)
+  assertMsg "Payout owner is Alice" ((fromSome mOut).owner == alice)
+
+  -- 2. All three smUSD-E tokens are archived — no change returned.
+  g1 <- queryContractId alice e1
+  g2 <- queryContractId alice e2
+  g3 <- queryContractId alice e3
+  assertMsg "e1 archived (no change)" (not (isSome g1))
+  assertMsg "e2 archived (no change)" (not (isSome g2))
+  assertMsg "e3 archived (no change)" (not (isSome g3))
+
+  -- 3. Service: totalShares reduced by ALL 300 provided shares (not just 150/sharePrice=150).
+  --    This proves the forfeit — extra 150 shares burned with no payout.
+  svc <- queryContractId operator poolSvcCid5
+  let s = fromSome svc
+  assertMsg "All 300 shares burned (forfeit confirms excess destroyed)"
+    (s.totalShares == 0.0)
+
+  -- 4. Only 150 minted, not 300 — no accidental over-withdrawal.
+  assertMsg "currentUnstakeMinted == requestedMusd only" (s.currentUnstakeMinted == 150.0)
+
+  debug "✅ 15. FORFEIT POLICY (ETHPool): all tokens archived, user gets exactly requestedMusd, excess shares destroyed"
+
+-- ============================================================
+-- 16. FORFEIT GOVERNANCE POLICY — Unstake_Batch (vault model)
+-- Dedicated test proving INTENTIONAL forfeit semantics for the
+-- vault (CantonStakingService) path:
+--   - All provided smUSD tokens archived.
+--   - User receives EXACTLY requestedMusd from vault.
+--   - Remaining vault holds the excess mUSD (benefits other stakers).
+--   - All provided shares are burned (not just requestedMusd / sharePrice worth).
+-- ============================================================
+
+test_Staking_UnstakeBatch_ForfeitGovPolicy : Script ()
+test_Staking_UnstakeBatch_ForfeitGovPolicy = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  stakeSvcCid <- createStakingService operator regCid
+
+  -- Fund pool: stake 3 × 100 mUSD → 300 shares, vault holds 300 mUSD
+  m1 <- mintMusd operator alice 100.0
+  m2 <- mintMusd operator alice 100.0
+  m3 <- mintMusd operator alice 100.0
+  (svc2, s1) <- submitMulti [alice] [operator] do
+    exerciseCmd stakeSvcCid Stake with user = alice; musdCid = m1
+  (svc3, s2) <- submitMulti [alice] [operator] do
+    exerciseCmd svc2 Stake with user = alice; musdCid = m2
+  (svc4, s3) <- submitMulti [alice] [operator] do
+    exerciseCmd svc3 Stake with user = alice; musdCid = m3
+
+  -- Batch unstake: provide all 3 tokens (300 shares) but request only 150 mUSD.
+  -- FORFEIT POLICY: all 3 tokens archived, all 300 shares burned,
+  -- user gets 150 mUSD, remaining 150 mUSD stays in vault.
+  (svc5, musdOut) <- submitMulti [alice] [operator] do
+    exerciseCmd svc4 Unstake_Batch with
+      user          = alice
+      smusdCids     = [s1, s2, s3]
+      requestedMusd = 150.0
+
+  -- 1. User receives EXACTLY requestedMusd — no over-withdrawal.
+  mOut <- queryContractId alice musdOut
+  assertMsg "Payout is exactly 150 mUSD" ((fromSome mOut).amount == 150.0)
+  assertMsg "Payout owner is Alice" ((fromSome mOut).owner == alice)
+
+  -- 2. All three smUSD tokens are archived — no change returned.
+  g1 <- queryContractId alice s1
+  g2 <- queryContractId alice s2
+  g3 <- queryContractId alice s3
+  assertMsg "s1 archived (no change)" (not (isSome g1))
+  assertMsg "s2 archived (no change)" (not (isSome g2))
+  assertMsg "s3 archived (no change)" (not (isSome g3))
+
+  -- 3. Service state: ALL 300 shares burned, vault retains excess 150 mUSD.
+  poolState <- queryContractId operator svc5
+  let p = fromSome poolState
+  assertMsg "All 300 shares burned (forfeit confirms excess destroyed)"
+    (p.totalShares == 0.0)
+
+  -- 4. Remaining vault holds exactly 150 mUSD (excess stays in pool).
+  assertMsg "Vault holds remaining 150 mUSD" (p.pooledMusd == 150.0)
+
+  debug "✅ 16. FORFEIT POLICY (Vault): all tokens archived, user gets exactly requestedMusd, excess stays in vault"

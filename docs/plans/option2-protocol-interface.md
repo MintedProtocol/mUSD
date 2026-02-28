@@ -2,7 +2,36 @@
 
 **Package:** `ble-protocol v1.2.0`
 **Branch:** `option2/protocol`
-**Status:** Implemented and tested (15/15 tests pass)
+**Status:** Implemented and tested (17/17 tests pass)
+
+---
+
+## Forfeit Policy — Governance Decision
+
+> **Policy adopted:** FORFEIT-EXCESS (retain-all-archive-exact-pay)
+
+All batch unstake choices (`ETHPool_BatchUnstake`, `Unstake_Batch`) archive ALL provided tokens unconditionally. The caller receives **exactly `requestedMusd`** mUSD. Any excess value in the provided tokens is **forfeited** — not returned to the caller.
+
+### Rationale
+
+Returning "change" would require re-minting new smUSD or smUSD-E tokens inside the choice, which introduces:
+- Re-locking (new `unlockAt` / `stakedAt` timestamps — potentially extending lock periods against the user's intent)
+- Tier-mismatch complexity for ETH pool positions
+- Additional compliance calls for newly created tokens
+
+The forfeit-excess model is deliberately simple and safe. It shifts the responsibility for minimal-covering-set selection to the **caller** (frontend or script).
+
+### Caller obligations
+
+- For `ETHPool_BatchUnstake` and `Unstake_Batch`: pass only the minimal set of tokens that covers `requestedMusd`. Use `SMUSDE_Split`/`SMUSD_Split` to pre-split if needed, or use the frontend helper `selectTokensForAmount` in `canton-balances.ts` which selects greedily by descending amount.
+- For `Lending_BatchDepositSMUSD`/`Lending_BatchDepositSMUSDE`: all provided tokens are deposited in full — no forfeit, no partial deposit.
+
+### Tests proving the policy (tests 15 and 16)
+
+| Test | Proves |
+|---|---|
+| `test_ETHPool_BatchUnstake_ForfeitGovPolicy` | User gets exactly `requestedMusd`; all tokens archived; service `totalShares == 0` (all shares burned, not just `requestedMusd/sharePrice`); `currentUnstakeMinted == 150` not 300 |
+| `test_Staking_UnstakeBatch_ForfeitGovPolicy` | User gets exactly `requestedMusd`; all tokens archived; service `totalShares == 0`; vault `pooledMusd == 150` (excess stays in pool) |
 
 ---
 
@@ -61,9 +90,9 @@ Compliance: `ValidateRedemption` is called on `complianceRegistryCid` (blacklist
   - `totalMusdStaked` reduced proportionally
   - `currentUnstakeMinted` increased by `requestedMusd`
 
-### Excess handling
+### Excess handling (FORFEIT POLICY)
 
-If the combined value of provided tokens exceeds `requestedMusd`, the excess yield is **not returned** — all tokens are archived but only `requestedMusd` mUSD is minted. Callers should use `SMUSDE_Split` beforehand to avoid leaving yield behind, or use the frontend helper `selectTokensForAmount` in `canton-balances.ts` to select the minimal covering set.
+If the combined value of provided tokens exceeds `requestedMusd`, the excess yield is **forfeited** — all tokens are archived but only `requestedMusd` mUSD is minted. No change is returned. See [Forfeit Policy](#forfeit-policy--governance-decision) for rationale. Use `SMUSDE_Split` beforehand to pre-split, or use `selectTokensForAmount` in `canton-balances.ts` to select the minimal covering set automatically.
 
 ---
 
@@ -114,9 +143,9 @@ Compliance: `ValidateRedemption` called on `complianceRegistryCid`.
   - `totalShares` reduced by shares consumed
   - `pooledMusd` reduced by `requestedMusd`
 
-### Vault mechanics
+### Vault mechanics (FORFEIT POLICY)
 
-Unlike `ETHPool_BatchUnstake`, this choice withdraws from an existing vault (vault-model staking). If the combined value of provided tokens exceeds `requestedMusd`, the excess stays in the pool — the extra shares are consumed but the extra mUSD remains, slightly increasing the remaining share price for other stakers. Use `SMUSD_Split` beforehand if exact withdrawal is required.
+Unlike `ETHPool_BatchUnstake`, this choice withdraws from an existing vault (vault-model staking). If the combined value of provided tokens exceeds `requestedMusd`, the excess stays in the vault for remaining stakers — the extra shares are burned, the extra mUSD remains in the pool, slightly increasing the remaining share price. No change is returned to the caller. See [Forfeit Policy](#forfeit-policy--governance-decision). Use `SMUSD_Split` beforehand if exact withdrawal is required.
 
 ---
 
@@ -248,7 +277,7 @@ All abort codes surface as `FAILED_PRECONDITION` gRPC status with the abort mess
 
 ## Test Coverage
 
-**File:** `BatchChoicesTest.daml` — 15 tests, all passing.
+**File:** `BatchChoicesTest.daml` — 17 tests, all passing.
 
 | # | Test | Choice |
 |---|---|---|
@@ -266,7 +295,9 @@ All abort codes surface as `FAILED_PRECONDITION` gRPC status with the abort mess
 | 12 | `test_Staking_UnstakeBatch_EmptyList` | Empty list → NO_POSITIONS_PROVIDED |
 | 13 | `test_Lending_BatchDepositSMUSD_Idempotency` | Second deposit adds to existing escrow |
 | 14 | `test_ETHPool_BatchUnstake_PartialRequest` | 3 positions (300 total), request 150 → 150 mUSD, all 3 archived |
-| 15 | `setupParties` | Helper (allocates parties, creates registry) |
+| 15 | `test_ETHPool_BatchUnstake_ForfeitGovPolicy` | FORFEIT POLICY proof for ETH pool: user gets exactly requestedMusd, all shares burned |
+| 16 | `test_Staking_UnstakeBatch_ForfeitGovPolicy` | FORFEIT POLICY proof for vault: user gets exactly requestedMusd, excess stays in vault |
+| 17 | `setupParties` | Helper (allocates parties, creates registry) |
 
 ---
 

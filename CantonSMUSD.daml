@@ -410,10 +410,16 @@ template CantonStakingService
     --   - Exactly `requestedMusd` mUSD is withdrawn from the vault and sent to user
     --   - Service totalShares / pooledMusd updated proportionally
     --
-    -- Excess vault value (if total > requestedMusd) remains in the pool
-    -- for remaining stakers — the extra shares are consumed but the extra
-    -- mUSD stays in the vault, slightly increasing the remaining share price.
-    -- Callers should use SMUSD_Split beforehand to avoid leaving yield behind.
+    -- FORFEIT POLICY (intentional, by design):
+    --   ALL provided smUSD tokens are archived unconditionally, even if
+    --   their combined vault value exceeds `requestedMusd`.  The caller receives
+    --   exactly `requestedMusd` mUSD; excess shares are burned and the surplus
+    --   mUSD remains in the pool, marginally benefiting remaining stakers.
+    --   This is a deliberate protocol-level policy — returning change would
+    --   require re-creating smUSD tokens inside the choice (complex, risky).
+    --   Callers MUST ensure they pass the minimal covering set of tokens.
+    --   Use SMUSD_Split to pre-split positions, or use the frontend helper
+    --   `selectTokensForAmount` in canton-balances.ts.
     choice Unstake_Batch : (ContractId CantonStakingService, ContractId CantonMUSD)
       with
         user          : Party

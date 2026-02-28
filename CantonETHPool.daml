@@ -471,11 +471,17 @@ template CantonETHPoolService
     --   - Exactly `requestedMusd` mUSD is created for the user
     --   - Service totalShares / totalMusdStaked / currentUnstakeMinted updated
     --
-    -- NOTE: If total value of provided tokens exceeds requestedMusd,
-    -- the excess is forfeit — callers should select tokens carefully or
-    -- use SMUSDE_Split beforehand to avoid losing yield.
-    -- The frontend helper `selectTokensForAmount` in canton-balances.ts
-    -- handles this automatically by selecting the minimal covering set.
+    -- FORFEIT POLICY (intentional, by design):
+    --   ALL provided smUSD-E tokens are archived unconditionally, even if
+    --   their combined value exceeds `requestedMusd`.  The caller receives
+    --   exactly `requestedMusd` mUSD; the excess yield is burned.
+    --   This is a deliberate protocol-level policy chosen for simplicity and
+    --   atomicity — returning change would require re-minting smUSD-E tokens
+    --   with new lock periods, adding compliance and tier-mismatch complexity.
+    --   Callers MUST ensure they pass the minimal covering set of tokens.
+    --   Use SMUSDE_Split to pre-split positions, or use the frontend helper
+    --   `selectTokensForAmount` in canton-balances.ts which selects the
+    --   smallest covering set automatically.
     choice ETHPool_BatchUnstake : (ContractId CantonETHPoolService, ContractId CantonMUSD)
       with
         user          : Party
@@ -527,10 +533,6 @@ template CantonETHPoolService
 
         -- Proportional shares consumed = requestedMusd / sharePrice
         let sharesConsumed = requestedMusd / sharePrice
-        -- musdStaked reduction proportional to shares consumed vs provided
-        let musdStakedReduction = if totalSharesProvided > 0.0
-              then totalMusdStakedSum * sharesConsumed / totalSharesProvided
-              else 0.0
 
         newService <- create this with
           totalShares          = totalShares - totalSharesProvided

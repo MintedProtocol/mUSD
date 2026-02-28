@@ -104,4 +104,16 @@ describe("/api/canton-batch-capability", () => {
     await handler(makeReq("POST"), res);
     expect(data.statusCode).toBe(405);
   });
+
+  it("405 response has typed JSON envelope with required fields", async () => {
+    const handler = await loadHandler();
+    const { res, data } = makeRes();
+    await handler(makeReq("POST"), res);
+    expect(data.statusCode).toBe(405);
+    const body = data.body as Record<string, unknown>;
+    expect(body.success).toBe(false);
+    expect(typeof body.error).toBe("string");
+    expect(typeof body.errorType).toBe("string");
+    expect(body.errorType).toBe("METHOD_NOT_ALLOWED");
+  });
 });

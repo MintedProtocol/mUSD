@@ -302,6 +302,81 @@ describe("/api/canton-batch-deposit", () => {
     expect(cmd1).not.toBe(cmd2);
   });
 
+  // ── upstream failure envelope tests ──────────────────────────────────
+
+  it("returns typed JSON envelope for HTML upstream error", async () => {
+    process.env.ENABLE_BATCH_CHOICES = "true";
+    const handler = await loadHandler();
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 502,
+      text: async () => "<html><body>Bad Gateway</body></html>",
+    });
+    const { res, data } = makeRes();
+    await handler(
+      makeReq({
+        party: TEST_PARTY,
+        collateralType: "smusd",
+        contractIds: ["abc123"],
+      }),
+      res
+    );
+    expect(data.statusCode).toBe(502);
+    const body = data.body as Record<string, unknown>;
+    expect(body.success).toBe(false);
+    expect(typeof body.error).toBe("string");
+    expect(typeof body.errorType).toBe("string");
+    expect(typeof body.fallbackAllowed).toBe("boolean");
+    expect(body.errorType).toBe("CANTON_ERROR");
+  });
+
+  it("returns typed JSON envelope for network error", async () => {
+    process.env.ENABLE_BATCH_CHOICES = "true";
+    const handler = await loadHandler();
+    mockFetch.mockRejectedValueOnce(new TypeError("fetch failed"));
+    const { res, data } = makeRes();
+    await handler(
+      makeReq({
+        party: TEST_PARTY,
+        collateralType: "smusd",
+        contractIds: ["abc123"],
+      }),
+      res
+    );
+    expect(data.statusCode).toBe(502);
+    const body = data.body as Record<string, unknown>;
+    expect(body.success).toBe(false);
+    expect(typeof body.error).toBe("string");
+    expect(typeof body.errorType).toBe("string");
+    expect(body.fallbackAllowed).toBe(true);
+  });
+
+  it("returns typed JSON envelope when upstream returns non-JSON on 200", async () => {
+    process.env.ENABLE_BATCH_CHOICES = "true";
+    const handler = await loadHandler();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => {
+        throw new SyntaxError("Unexpected token < in JSON at position 0");
+      },
+    });
+    const { res, data } = makeRes();
+    await handler(
+      makeReq({
+        party: TEST_PARTY,
+        collateralType: "smusd",
+        contractIds: ["abc123"],
+      }),
+      res
+    );
+    expect(data.statusCode).toBe(502);
+    const body = data.body as Record<string, unknown>;
+    expect(body.success).toBe(false);
+    expect(typeof body.error).toBe("string");
+    expect(typeof body.errorType).toBe("string");
+    expect(body.errorType).toBe("CANTON_ERROR");
+  });
+
   it("classifies Canton SMUSD_NOT_ENABLED error", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
     const handler = await loadHandler();

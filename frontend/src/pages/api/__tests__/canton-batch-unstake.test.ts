@@ -18,14 +18,14 @@
 
 export {}; // ensure this is treated as a module
 
-const mockFetch = jest.fn();
+const mockFetch = vi.fn();
 (global as Record<string, unknown>).fetch = mockFetch;
 
 beforeAll(() => {
-  jest.spyOn(console, "log").mockImplementation(() => {});
-  jest.spyOn(console, "error").mockImplementation(() => {});
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
 });
-afterAll(() => jest.restoreAllMocks());
+afterAll(() => vi.restoreAllMocks());
 
 const TEST_PARTY = "alice::1220" + "0".repeat(64);
 const TEST_PKG = "c".repeat(64);
@@ -49,12 +49,12 @@ function makeRes() {
   return { res, data };
 }
 
-function loadHandler() {
-  jest.resetModules();
+async function loadHandler() {
+  vi.resetModules();
   process.env.CANTON_PACKAGE_ID = TEST_PKG;
   process.env.CANTON_PARTY = TEST_PARTY;
   process.env.CANTON_TOKEN = "test-token";
-  return require("../canton-batch-unstake").default as (
+  return (await import("../canton-batch-unstake")).default as (
     req: import("next").NextApiRequest,
     res: import("next").NextApiResponse
   ) => Promise<void>;
@@ -106,7 +106,7 @@ describe("/api/canton-batch-unstake", () => {
 
   it("returns 404 when ENABLE_BATCH_CHOICES is unset", async () => {
     delete process.env.ENABLE_BATCH_CHOICES;
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(
       makeReq({
@@ -123,7 +123,7 @@ describe("/api/canton-batch-unstake", () => {
 
   it("returns 405 for GET requests", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(makeReq({}, "GET"), res);
     expect(data.statusCode).toBe(405);
@@ -131,7 +131,7 @@ describe("/api/canton-batch-unstake", () => {
 
   it("returns 400 for missing pool field", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(
       makeReq({ party: TEST_PARTY, contractIds: ["cid-1"], requestedMusd: "100" }),
@@ -143,7 +143,7 @@ describe("/api/canton-batch-unstake", () => {
 
   it("returns 400 for invalid pool value", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(
       makeReq({
@@ -159,7 +159,7 @@ describe("/api/canton-batch-unstake", () => {
 
   it("returns 400 for empty contractIds array", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(
       makeReq({
@@ -176,7 +176,7 @@ describe("/api/canton-batch-unstake", () => {
 
   it("returns 400 for negative requestedMusd", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(
       makeReq({
@@ -193,7 +193,7 @@ describe("/api/canton-batch-unstake", () => {
 
   it("returns 400 for duplicate contract IDs", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(
       makeReq({
@@ -211,7 +211,7 @@ describe("/api/canton-batch-unstake", () => {
   it("returns 404 when per-choice flag disables ETHPool_BatchUnstake", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
     process.env.DISABLE_ETHPOOL_BATCH_UNSTAKE = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(
       makeReq({
@@ -229,7 +229,7 @@ describe("/api/canton-batch-unstake", () => {
   it("returns 404 when per-choice flag disables Unstake_Batch", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
     process.env.DISABLE_SMUSD_BATCH_UNSTAKE = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(
       makeReq({
@@ -245,7 +245,7 @@ describe("/api/canton-batch-unstake", () => {
 
   it("returns 200 on success (ethpool)", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     mockCantonSuccess();
     const { res, data } = makeRes();
     await handler(
@@ -267,7 +267,7 @@ describe("/api/canton-batch-unstake", () => {
 
   it("returns 502 when no service contract found", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     mockFetch
       .mockResolvedValueOnce({ ok: true, json: async () => ({ offset: "1000" }) })
       .mockResolvedValueOnce({ ok: true, json: async () => [] }); // empty contracts
@@ -287,7 +287,7 @@ describe("/api/canton-batch-unstake", () => {
 
   it("classifies Canton SERVICE_PAUSED error", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     mockFetch
       .mockResolvedValueOnce({ ok: true, json: async () => ({ offset: "1000" }) })
       .mockResolvedValueOnce({
@@ -326,7 +326,7 @@ describe("/api/canton-batch-unstake", () => {
 
   it("returns 500 when CANTON_PARTY is not configured", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     delete process.env.CANTON_PARTY; // delete after load so env getter reads missing value
     const { res, data } = makeRes();
     await handler(

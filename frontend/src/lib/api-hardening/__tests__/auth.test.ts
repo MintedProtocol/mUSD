@@ -33,20 +33,20 @@ function makeRes() {
 const TEST_PARTY = "testuser::1220" + "a".repeat(64);
 const ALIASED_PARTY = "resolved::1220" + "b".repeat(64);
 
-function loadAuth() {
-  jest.resetModules();
-  return require("../auth") as typeof import("../auth");
+async function loadAuth() {
+  vi.resetModules();
+  return await import("../auth");
 }
 
 describe("guardMethod", () => {
-  it("returns true for matching method", () => {
-    const { guardMethod } = loadAuth();
+  it("returns true for matching method", async () => {
+    const { guardMethod } = await loadAuth();
     const { res } = makeRes();
     expect(guardMethod(makeReq("POST"), res, "POST")).toBe(true);
   });
 
-  it("returns false and 405 with typed envelope for wrong method", () => {
-    const { guardMethod } = loadAuth();
+  it("returns false and 405 with typed envelope for wrong method", async () => {
+    const { guardMethod } = await loadAuth();
     const { res, data } = makeRes();
     expect(guardMethod(makeReq("GET"), res, "POST")).toBe(false);
     expect(data.statusCode).toBe(405);
@@ -62,26 +62,26 @@ describe("guardBodyParty", () => {
 
   beforeEach(() => {
     process.env = { ...originalEnv };
-    jest.resetModules();
+    vi.resetModules();
   });
   afterEach(() => {
     process.env = originalEnv;
   });
 
-  it("returns resolved party for valid input", () => {
-    const { guardBodyParty } = loadAuth();
+  it("returns resolved party for valid input", async () => {
+    const { guardBodyParty } = await loadAuth();
     const { res, data } = makeRes();
     const result = guardBodyParty(makeReq("POST", { party: TEST_PARTY }), res);
     expect(result).toBe(TEST_PARTY);
     expect(data.statusCode).toBe(0);
   });
 
-  it("resolves alias when CANTON_RECIPIENT_PARTY_ALIASES is set", () => {
+  it("resolves alias when CANTON_RECIPIENT_PARTY_ALIASES is set", async () => {
     process.env.CANTON_RECIPIENT_PARTY_ALIASES = JSON.stringify({
       [TEST_PARTY]: ALIASED_PARTY,
     });
     process.env.CANTON_PARTY = "operator::1220" + "c".repeat(64);
-    const { guardBodyParty } = loadAuth();
+    const { guardBodyParty } = await loadAuth();
     const { res } = makeRes();
     const result = guardBodyParty(makeReq("POST", { party: TEST_PARTY }), res);
     expect(result).toBe(ALIASED_PARTY);
@@ -89,8 +89,8 @@ describe("guardBodyParty", () => {
 
   // ── input errors → 400 INVALID_INPUT ────────────────────────────────
 
-  it("returns null and 400 INVALID_INPUT for missing party", () => {
-    const { guardBodyParty } = loadAuth();
+  it("returns null and 400 INVALID_INPUT for missing party", async () => {
+    const { guardBodyParty } = await loadAuth();
     const { res, data } = makeRes();
     const result = guardBodyParty(makeReq("POST", {}), res);
     expect(result).toBeNull();
@@ -100,8 +100,8 @@ describe("guardBodyParty", () => {
     expect(body.errorType).toBe("INVALID_INPUT");
   });
 
-  it("returns null and 400 INVALID_INPUT for empty string party", () => {
-    const { guardBodyParty } = loadAuth();
+  it("returns null and 400 INVALID_INPUT for empty string party", async () => {
+    const { guardBodyParty } = await loadAuth();
     const { res, data } = makeRes();
     const result = guardBodyParty(makeReq("POST", { party: "   " }), res);
     expect(result).toBeNull();
@@ -110,8 +110,8 @@ describe("guardBodyParty", () => {
     expect(body.errorType).toBe("INVALID_INPUT");
   });
 
-  it("returns null and 400 INVALID_INPUT for invalid party format", () => {
-    const { guardBodyParty } = loadAuth();
+  it("returns null and 400 INVALID_INPUT for invalid party format", async () => {
+    const { guardBodyParty } = await loadAuth();
     const { res, data } = makeRes();
     const result = guardBodyParty(makeReq("POST", { party: "not-a-valid-party" }), res);
     expect(result).toBeNull();
@@ -123,9 +123,9 @@ describe("guardBodyParty", () => {
 
   // ── config errors → 500 CONFIG_ERROR ────────────────────────────────
 
-  it("returns null and 500 CONFIG_ERROR for malformed alias JSON", () => {
+  it("returns null and 500 CONFIG_ERROR for malformed alias JSON", async () => {
     process.env.CANTON_RECIPIENT_PARTY_ALIASES = "not valid json {{{";
-    const { guardBodyParty } = loadAuth();
+    const { guardBodyParty } = await loadAuth();
     const { res, data } = makeRes();
     const result = guardBodyParty(makeReq("POST", { party: TEST_PARTY }), res);
     expect(result).toBeNull();
@@ -136,7 +136,7 @@ describe("guardBodyParty", () => {
     expect(body.resolverErrorType).toBe("MALFORMED_ALIAS_JSON");
   });
 
-  it("returns null and 500 CONFIG_ERROR for alias policy violation", () => {
+  it("returns null and 500 CONFIG_ERROR for alias policy violation", async () => {
     const operatorParty = "operator::1220" + "c".repeat(64);
     const nonOperatorKey = "attacker::1220" + "d".repeat(64);
     process.env.CANTON_PARTY = operatorParty;
@@ -144,7 +144,7 @@ describe("guardBodyParty", () => {
     process.env.CANTON_RECIPIENT_PARTY_ALIASES = JSON.stringify({
       [nonOperatorKey]: operatorParty,
     });
-    const { guardBodyParty } = loadAuth();
+    const { guardBodyParty } = await loadAuth();
     const { res, data } = makeRes();
     const result = guardBodyParty(makeReq("POST", { party: TEST_PARTY }), res);
     expect(result).toBeNull();
@@ -155,11 +155,11 @@ describe("guardBodyParty", () => {
     expect(body.resolverErrorType).toBe("ALIAS_POLICY_VIOLATION");
   });
 
-  it("returns null and 500 CONFIG_ERROR for non-string alias values", () => {
+  it("returns null and 500 CONFIG_ERROR for non-string alias values", async () => {
     process.env.CANTON_RECIPIENT_PARTY_ALIASES = JSON.stringify({
       [TEST_PARTY]: 12345,
     });
-    const { guardBodyParty } = loadAuth();
+    const { guardBodyParty } = await loadAuth();
     const { res, data } = makeRes();
     const result = guardBodyParty(makeReq("POST", { party: TEST_PARTY }), res);
     expect(result).toBeNull();
@@ -169,11 +169,11 @@ describe("guardBodyParty", () => {
     expect(body.resolverErrorType).toBe("MALFORMED_ALIAS_JSON");
   });
 
-  it("returns null and 500 CONFIG_ERROR for null alias values", () => {
+  it("returns null and 500 CONFIG_ERROR for null alias values", async () => {
     process.env.CANTON_RECIPIENT_PARTY_ALIASES = JSON.stringify({
       [TEST_PARTY]: null,
     });
-    const { guardBodyParty } = loadAuth();
+    const { guardBodyParty } = await loadAuth();
     const { res, data } = makeRes();
     const result = guardBodyParty(makeReq("POST", { party: TEST_PARTY }), res);
     expect(result).toBeNull();
@@ -184,11 +184,11 @@ describe("guardBodyParty", () => {
     expect((body.error as string)).toContain("non-empty string");
   });
 
-  it("returns null and 500 CONFIG_ERROR for empty string alias values", () => {
+  it("returns null and 500 CONFIG_ERROR for empty string alias values", async () => {
     process.env.CANTON_RECIPIENT_PARTY_ALIASES = JSON.stringify({
       [TEST_PARTY]: "   ",
     });
-    const { guardBodyParty } = loadAuth();
+    const { guardBodyParty } = await loadAuth();
     const { res, data } = makeRes();
     const result = guardBodyParty(makeReq("POST", { party: TEST_PARTY }), res);
     expect(result).toBeNull();
@@ -200,8 +200,8 @@ describe("guardBodyParty", () => {
 
   // ── extraFields / custom field ──────────────────────────────────────
 
-  it("propagates extraFields on error", () => {
-    const { guardBodyParty } = loadAuth();
+  it("propagates extraFields on error", async () => {
+    const { guardBodyParty } = await loadAuth();
     const { res, data } = makeRes();
     guardBodyParty(makeReq("POST", {}), res, {
       extraFields: { mode: "batch", pool: "ethpool" },
@@ -211,9 +211,9 @@ describe("guardBodyParty", () => {
     expect(body.pool).toBe("ethpool");
   });
 
-  it("propagates extraFields on config error", () => {
+  it("propagates extraFields on config error", async () => {
     process.env.CANTON_RECIPIENT_PARTY_ALIASES = "BAD JSON";
-    const { guardBodyParty } = loadAuth();
+    const { guardBodyParty } = await loadAuth();
     const { res, data } = makeRes();
     guardBodyParty(makeReq("POST", { party: TEST_PARTY }), res, {
       extraFields: { mode: "batch" },
@@ -223,8 +223,8 @@ describe("guardBodyParty", () => {
     expect(body.mode).toBe("batch");
   });
 
-  it("uses custom fieldName", () => {
-    const { guardBodyParty } = loadAuth();
+  it("uses custom fieldName", async () => {
+    const { guardBodyParty } = await loadAuth();
     const { res, data } = makeRes();
     guardBodyParty(makeReq("POST", { user: TEST_PARTY }), res, {
       fieldName: "user",

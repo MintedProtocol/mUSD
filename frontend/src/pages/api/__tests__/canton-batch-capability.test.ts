@@ -10,10 +10,10 @@
  */
 
 beforeAll(() => {
-  jest.spyOn(console, "log").mockImplementation(() => {});
-  jest.spyOn(console, "error").mockImplementation(() => {});
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
 });
-afterAll(() => jest.restoreAllMocks());
+afterAll(() => vi.restoreAllMocks());
 
 function makeReq(method = "GET") {
   return { method, body: {} } as unknown as import("next").NextApiRequest;
@@ -34,9 +34,9 @@ function makeRes() {
   return { res, data };
 }
 
-function loadHandler() {
-  jest.resetModules();
-  return require("../canton-batch-capability").default as (
+async function loadHandler() {
+  vi.resetModules();
+  return (await import("../canton-batch-capability")).default as (
     req: import("next").NextApiRequest,
     res: import("next").NextApiResponse
   ) => Promise<void>;
@@ -54,7 +54,7 @@ describe("/api/canton-batch-capability", () => {
 
   it("returns all choices OFF when ENABLE_BATCH_CHOICES is unset", async () => {
     delete process.env.ENABLE_BATCH_CHOICES;
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(makeReq(), res);
     expect(data.statusCode).toBe(200);
@@ -69,7 +69,7 @@ describe("/api/canton-batch-capability", () => {
 
   it("returns all choices ON when ENABLE_BATCH_CHOICES is true", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(makeReq(), res);
     expect(data.statusCode).toBe(200);
@@ -83,7 +83,7 @@ describe("/api/canton-batch-capability", () => {
   it("reflects per-choice disable overrides", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
     process.env.DISABLE_ETHPOOL_BATCH_UNSTAKE = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(makeReq(), res);
     const choices = (data.body as Record<string, unknown>).choices as Record<string, boolean>;
@@ -92,14 +92,14 @@ describe("/api/canton-batch-capability", () => {
   });
 
   it("returns version string", async () => {
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(makeReq(), res);
     expect((data.body as Record<string, unknown>).version).toBe("1.2.0");
   });
 
   it("returns 405 for POST requests", async () => {
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(makeReq("POST"), res);
     expect(data.statusCode).toBe(405);

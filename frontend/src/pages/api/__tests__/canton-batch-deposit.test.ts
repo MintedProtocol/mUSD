@@ -13,14 +13,14 @@
  */
 export {}; // ensure this is treated as a module
 
-const mockFetch = jest.fn();
+const mockFetch = vi.fn();
 (global as Record<string, unknown>).fetch = mockFetch;
 
 beforeAll(() => {
-  jest.spyOn(console, "log").mockImplementation(() => {});
-  jest.spyOn(console, "error").mockImplementation(() => {});
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
 });
-afterAll(() => jest.restoreAllMocks());
+afterAll(() => vi.restoreAllMocks());
 
 const TEST_PARTY = "alice::1220" + "0".repeat(64);
 const TEST_PKG = "d".repeat(64);
@@ -45,13 +45,13 @@ function makeRes() {
   return { res, data };
 }
 
-function loadHandler() {
-  jest.resetModules();
+async function loadHandler() {
+  vi.resetModules();
   process.env.CANTON_PACKAGE_ID = TEST_PKG;
   process.env.CANTON_LENDING_PACKAGE_ID = TEST_LENDING_PKG;
   process.env.CANTON_PARTY = TEST_PARTY;
   process.env.CANTON_TOKEN = "test-token";
-  return require("../canton-batch-deposit").default as (
+  return (await import("../canton-batch-deposit")).default as (
     req: import("next").NextApiRequest,
     res: import("next").NextApiResponse
   ) => Promise<void>;
@@ -91,7 +91,7 @@ describe("/api/canton-batch-deposit", () => {
 
   it("returns 404 when ENABLE_BATCH_CHOICES is unset", async () => {
     delete process.env.ENABLE_BATCH_CHOICES;
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(
       makeReq({
@@ -107,7 +107,7 @@ describe("/api/canton-batch-deposit", () => {
 
   it("returns 400 for missing collateralType", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(
       makeReq({ party: TEST_PARTY, contractIds: ["cid-1"] }),
@@ -119,7 +119,7 @@ describe("/api/canton-batch-deposit", () => {
 
   it("returns 400 for invalid collateralType", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(
       makeReq({
@@ -134,7 +134,7 @@ describe("/api/canton-batch-deposit", () => {
 
   it("returns 400 for empty contractIds", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     const { res, data } = makeRes();
     await handler(
       makeReq({
@@ -150,7 +150,7 @@ describe("/api/canton-batch-deposit", () => {
 
   it("returns 200 on success (smusd deposit)", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     mockCantonSuccess();
     const { res, data } = makeRes();
     await handler(
@@ -171,7 +171,7 @@ describe("/api/canton-batch-deposit", () => {
 
   it("returns 200 on success (smusde deposit with escrow)", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     mockCantonSuccess();
     const { res, data } = makeRes();
     await handler(
@@ -191,7 +191,7 @@ describe("/api/canton-batch-deposit", () => {
 
   it("treats absent escrowCid as null (not error)", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     mockCantonSuccess();
     const { res, data } = makeRes();
     await handler(
@@ -208,7 +208,7 @@ describe("/api/canton-batch-deposit", () => {
 
   it("returns 502 when no lending service contract found", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     mockFetch
       .mockResolvedValueOnce({ ok: true, json: async () => ({ offset: "2000" }) })
       .mockResolvedValueOnce({ ok: true, json: async () => [] });
@@ -227,7 +227,7 @@ describe("/api/canton-batch-deposit", () => {
 
   it("produces different idempotency keys for different collateralAggCid", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
 
     // First call with aggCid = "agg-A"
     mockCantonSuccess();
@@ -268,7 +268,7 @@ describe("/api/canton-batch-deposit", () => {
 
   it("produces different idempotency keys for different existingEscrowCid", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
 
     // First call with escrow = null
     mockCantonSuccess();
@@ -304,7 +304,7 @@ describe("/api/canton-batch-deposit", () => {
 
   it("classifies Canton SMUSD_NOT_ENABLED error", async () => {
     process.env.ENABLE_BATCH_CHOICES = "true";
-    const handler = loadHandler();
+    const handler = await loadHandler();
     mockFetch
       .mockResolvedValueOnce({ ok: true, json: async () => ({ offset: "2000" }) })
       .mockResolvedValueOnce({

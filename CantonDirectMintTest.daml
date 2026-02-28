@@ -1,0 +1,1368 @@
+-- | CantonDirectMintTest
+-- Comprehensive test suite for the Canton Direct Mint module.
+--
+-- Tests:
+--   1. Basic USDC → mUSD mint flow (happy path)
+--   2. USDCx → mUSD mint flow (xReserve bridged USDC)
+--   3. Redemption flow (mUSD → RedemptionRequest)
+--   4. Supply cap enforcement
+--   5. Daily mint rate limiting
+--   6. Pause/unpause
+--   7. CantonUSDC token: transfer, split, reject
+--   8. USDCx token: transfer, split, burn
+--   9. CantonMUSD token: transfer, split, merge, proposals
+--  10. BridgeOutRequest: complete, fail, refund
+--  11. ReserveTracker accounting
+--  12. BurnRateLimiter
+--  13. Governance-gated admin choices
+--  14. Redemption fulfillment
+--  15. Negative tests: blacklisted, paused, below min
+--  16. Full lifecycle
+
+module CantonDirectMintTest where
+
+import CantonDirectMint
+import CantonSMUSD (CantonSMUSD(..), CantonStakingService(..), StakeFromInventory(..))
+import Compliance (ComplianceRegistry(..), ValidateMint(..))
+import Governance (GovernanceActionLog(..), ActionType(..), ConsumeProof(..))
+import DA.Set qualified as Set
+import DA.Time
+import DA.Date
+import Daml.Script
+
+-- ============================================================
+--                     HELPERS
+-- ============================================================
+
+testMpaHash : Text
+testMpaHash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+
+testMpaUri : Text
+testMpaUri = "https://minted.finance/mpa"
+
+createCompliance : Party -> Party -> Script (ContractId ComplianceRegistry)
+createCompliance regulator operator = do
+  now <- getTime
+  submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.empty
+      frozen = Set.empty
+      lastUpdated = now
+
+createGovProof : Party -> ActionType -> Text -> Script (ContractId GovernanceActionLog)
+createGovProof operator actionType targetModule = do
+  now <- getTime
+  submit operator do
+    createCmd GovernanceActionLog with
+      operator; proposalId = "test-1"; actionType
+      description = "Test"; payload = "{}"
+      payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      targetModule; approvers = [operator]
+      executedBy = operator; executedAt = now
+
+createUSDC : Party -> Party -> Money -> Script (ContractId CantonUSDC)
+createUSDC issuer owner amount =
+  submitMulti [issuer, owner] [] do
+    createCmd CantonUSDC with issuer; owner; amount; privacyObservers = []
+
+createUSDCx : Party -> Party -> Money -> Script (ContractId USDCx)
+createUSDCx issuer owner amount =
+  submitMulti [issuer, owner] [] do
+    createCmd USDCx with
+      issuer; owner; amount
+      sourceChain = "ethereum"; cctpNonce = 1; privacyObservers = []
+
+createMUSD : Party -> Party -> Money -> Script (ContractId CantonMUSD)
+createMUSD issuer owner amount =
+  submitMulti [issuer, owner] [] do
+    createCmd CantonMUSD with
+      issuer; owner; amount
+      agreementHash = testMpaHash; agreementUri = testMpaUri; privacyObservers = []
+
+createMintService : Party -> Party -> ContractId ComplianceRegistry -> [Party] -> Script (ContractId CantonDirectMintService)
+createMintService operator usdcIssuer complianceCid minters = do
+  now <- getTime
+  submit operator do
+    createCmd CantonDirectMintService with
+      operator; usdcIssuer; usdcxIssuer = Some operator
+      mintFeeBps = 30; redeemFeeBps = 30
+      minAmount = 1.0; maxAmount = 1000000.0
+      supplyCap = 10000000.0; currentSupply = 0.0
+      accumulatedFees = 0.0; paused = False
+      validators = [operator]; targetChainId = 1
+      targetTreasury = "0x1234567890abcdef1234567890abcdef12345678"
+      nextNonce = 1; dailyMintLimit = 5000000.0
+      dailyMinted = 0.0; dailyBurned = 0.0
+      lastRateLimitReset = now
+      complianceRegistryCid = complianceCid
+      mpaHash = testMpaHash; mpaUri = testMpaUri; authorizedMinters = minters
+      cantonCoinPrice = None
+      serviceName = "CantonDirectMint"
+
+-- ============================================================
+--         TEST 1: BASIC USDC → mUSD MINT
+-- ============================================================
+
+test_BasicMint : Script ()
+test_BasicMint = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  mintSvc <- createMintService operator operator complianceCid [alice]
+  usdcCid <- createUSDC operator alice 1000.0
+
+  (svc2, musdCid, bridgeCid) <- submitMulti [alice] [operator] do
+    exerciseCmd mintSvc DirectMint_Mint with user = alice; usdcCid
+
+  musd <- queryContractId alice musdCid
+  case musd of
+    Some m -> do
+      assertMsg "owner" (m.owner == alice)
+      assertMsg "amount (1000 - 0.3% = 997)" (m.amount == 997.0)
+    None -> abort "mUSD not found"
+
+  br <- queryContractId operator bridgeCid
+  case br of
+    Some b -> assertMsg "bridge pending" (b.status == "pending")
+    None -> abort "BridgeOutRequest not found"
+  pure ()
+
+-- ============================================================
+--         TEST 2: USDCx → mUSD MINT
+-- ============================================================
+
+test_MintWithUSDCx : Script ()
+test_MintWithUSDCx = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  mintSvc <- createMintService operator operator complianceCid [alice]
+  usdcxCid <- createUSDCx operator alice 5000.0
+
+  (_, musdCid, _) <- submitMulti [alice] [operator] do
+    exerciseCmd mintSvc DirectMint_MintWithUSDCx with user = alice; usdcxCid
+
+  musd <- queryContractId alice musdCid
+  case musd of
+    Some m -> assertMsg "amount (5000 - 0.3% = 4985)" (m.amount == 4985.0)
+    None -> abort "mUSD from USDCx not found"
+  pure ()
+
+-- ============================================================
+--         TEST 3: REDEMPTION FLOW
+-- ============================================================
+
+test_RedeemFlow : Script ()
+test_RedeemFlow = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  mintSvc <- createMintService operator operator complianceCid [alice]
+  usdcCid <- createUSDC operator alice 1000.0
+
+  (svc2, musdCid, _) <- submitMulti [alice] [operator] do
+    exerciseCmd mintSvc DirectMint_Mint with user = alice; usdcCid
+
+  (svc3, redemptionCid) <- submitMulti [alice] [operator] do
+    exerciseCmd svc2 DirectMint_Redeem with user = alice; musdCid
+
+  r <- queryContractId alice redemptionCid
+  case r of
+    Some req -> do
+      assertMsg "not fulfilled" (not req.fulfilled)
+      assertMsg "usdc owed positive" (req.usdcOwed > 0.0)
+    None -> abort "RedemptionRequest not found"
+  pure ()
+
+-- ============================================================
+--         TEST 4: SUPPLY CAP ENFORCEMENT
+-- ============================================================
+
+test_SupplyCapEnforced : Script ()
+test_SupplyCapEnforced = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  now <- getTime
+
+  svc <- submit operator do
+    createCmd CantonDirectMintService with
+      operator; usdcIssuer = operator; usdcxIssuer = Some operator
+      mintFeeBps = 0; redeemFeeBps = 0
+      minAmount = 1.0; maxAmount = 1000000.0
+      supplyCap = 100.0; currentSupply = 0.0
+      accumulatedFees = 0.0; paused = False
+      validators = [operator]; targetChainId = 1
+      targetTreasury = "0x1234567890abcdef1234567890abcdef12345678"
+      nextNonce = 1; dailyMintLimit = 5000000.0
+      dailyMinted = 0.0; dailyBurned = 0.0
+      lastRateLimitReset = now
+      complianceRegistryCid = complianceCid
+      mpaHash = testMpaHash; mpaUri = testMpaUri; authorizedMinters = []; cantonCoinPrice = None; serviceName = "CantonDirectMint"
+
+  usdcCid <- createUSDC operator alice 200.0
+  submitMustFail alice do
+    exerciseCmd svc DirectMint_Mint with user = alice; usdcCid
+  pure ()
+
+-- ============================================================
+--         TEST 5: DAILY MINT RATE LIMIT
+-- ============================================================
+
+test_DailyMintRateLimit : Script ()
+test_DailyMintRateLimit = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  now <- getTime
+
+  svc <- submit operator do
+    createCmd CantonDirectMintService with
+      operator; usdcIssuer = operator; usdcxIssuer = Some operator
+      mintFeeBps = 0; redeemFeeBps = 0
+      minAmount = 1.0; maxAmount = 1000000.0
+      supplyCap = 10000000.0; currentSupply = 0.0
+      accumulatedFees = 0.0; paused = False
+      validators = [operator]; targetChainId = 1
+      targetTreasury = "0x1234567890abcdef1234567890abcdef12345678"
+      nextNonce = 1; dailyMintLimit = 100.0
+      dailyMinted = 0.0; dailyBurned = 0.0
+      lastRateLimitReset = now
+      complianceRegistryCid = complianceCid
+      mpaHash = testMpaHash; mpaUri = testMpaUri; authorizedMinters = [alice]; cantonCoinPrice = None; serviceName = "CantonDirectMint"
+
+  usdcCid1 <- createUSDC operator alice 80.0
+  (svc2, _, _) <- submitMulti [alice] [operator] do
+    exerciseCmd svc DirectMint_Mint with user = alice; usdcCid = usdcCid1
+
+  usdcCid2 <- createUSDC operator alice 50.0
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd svc2 DirectMint_Mint with user = alice; usdcCid = usdcCid2
+  pure ()
+
+-- ============================================================
+--         TEST 6: PAUSE / UNPAUSE
+-- ============================================================
+
+test_PausedMintFails : Script ()
+test_PausedMintFails = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  svc <- createMintService operator operator complianceCid [alice]
+
+  pausedSvc <- submit operator do
+    exerciseCmd svc DirectMint_SetPaused with newPaused = True
+
+  usdcCid <- createUSDC operator alice 100.0
+  submitMustFail alice do
+    exerciseCmd pausedSvc DirectMint_Mint with user = alice; usdcCid
+
+  unpausedSvc <- submit operator do
+    exerciseCmd pausedSvc DirectMint_SetPaused with newPaused = False
+
+  usdcCid2 <- createUSDC operator alice 100.0
+  submitMulti [alice] [operator] do
+    exerciseCmd unpausedSvc DirectMint_Mint with user = alice; usdcCid = usdcCid2
+  pure ()
+
+-- ============================================================
+--         TEST 7: CANTON USDC — TRANSFER, REJECT, SPLIT
+-- ============================================================
+
+test_CantonUSDCTransfer : Script ()
+test_CantonUSDCTransfer = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  usdcCid <- createUSDC operator alice 1000.0
+
+  proposalCid <- submitMulti [alice] [operator] do
+    exerciseCmd usdcCid CantonUSDC_Transfer with newOwner = bob; complianceRegistryCid = complianceCid
+
+  newCid <- submit bob do
+    exerciseCmd proposalCid CantonUSDCTransferProposal_Accept
+
+  u <- queryContractId bob newCid
+  case u of
+    Some usdc -> assertMsg "new owner" (usdc.owner == bob)
+    None -> abort "Transferred USDC not found"
+  pure ()
+
+test_CantonUSDCReject : Script ()
+test_CantonUSDCReject = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  usdcCid <- createUSDC operator alice 500.0
+
+  proposalCid <- submitMulti [alice] [operator] do
+    exerciseCmd usdcCid CantonUSDC_Transfer with newOwner = bob; complianceRegistryCid = complianceCid
+
+  returnedCid <- submit bob do
+    exerciseCmd proposalCid CantonUSDCTransferProposal_Reject
+
+  u <- queryContractId alice returnedCid
+  case u of
+    Some usdc -> assertMsg "returned to alice" (usdc.owner == alice)
+    None -> abort "Rejected USDC not found"
+  pure ()
+
+test_CantonUSDCSplit : Script ()
+test_CantonUSDCSplit = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  usdcCid <- createUSDC operator alice 1000.0
+
+  (c1, c2) <- submit alice do
+    exerciseCmd usdcCid CantonUSDC_Split with splitAmount = 300.0
+
+  u1 <- queryContractId alice c1
+  u2 <- queryContractId alice c2
+  case (u1, u2) of
+    (Some a, Some b) -> do
+      assertMsg "part1" (a.amount == 300.0)
+      assertMsg "part2" (b.amount == 700.0)
+    _ -> abort "Split failed"
+  pure ()
+
+-- ============================================================
+--         TEST 8: USDCx — TRANSFER, SPLIT, BURN
+-- ============================================================
+
+test_USDCxTransfer : Script ()
+test_USDCxTransfer = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  usdcxCid <- createUSDCx operator alice 2000.0
+
+  proposalCid <- submitMulti [alice] [operator] do
+    exerciseCmd usdcxCid USDCx_Transfer with newOwner = bob; complianceRegistryCid = complianceCid
+
+  newCid <- submitMulti [bob] [operator] do
+    exerciseCmd proposalCid USDCxTransferProposal_Accept with complianceRegistryCid = complianceCid
+
+  u <- queryContractId bob newCid
+  case u of
+    Some ux -> assertMsg "USDCx owner" (ux.owner == bob)
+    None -> abort "USDCx transfer failed"
+  pure ()
+
+test_USDCxSplit : Script ()
+test_USDCxSplit = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  usdcxCid <- createUSDCx operator alice 1000.0
+
+  (c1, c2) <- submit alice do
+    exerciseCmd usdcxCid USDCx_Split with splitAmount = 400.0
+
+  u1 <- queryContractId alice c1
+  u2 <- queryContractId alice c2
+  case (u1, u2) of
+    (Some a, Some b) -> do
+      assertMsg "part1" (a.amount == 400.0)
+      assertMsg "part2" (b.amount == 600.0)
+    _ -> abort "USDCx split failed"
+  pure ()
+
+test_USDCxBurn : Script ()
+test_USDCxBurn = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  usdcxCid <- createUSDCx operator alice 500.0
+
+  submitMulti [operator] [] do
+    exerciseCmd usdcxCid USDCx_Burn
+
+  result <- queryContractId operator usdcxCid
+  case result of
+    Some _ -> abort "Should be burned"
+    None -> pure ()
+  pure ()
+
+-- ============================================================
+--         TEST 9: CANTON mUSD — TRANSFER, SPLIT, MERGE, PROPOSALS
+-- ============================================================
+
+test_CantonMUSDTransfer : Script ()
+test_CantonMUSDTransfer = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  musdCid <- createMUSD operator alice 1000.0
+
+  proposalCid <- submitMulti [alice] [operator] do
+    exerciseCmd musdCid CantonMUSD_Transfer with newOwner = bob; complianceRegistryCid = complianceCid
+
+  newCid <- submit bob do
+    exerciseCmd proposalCid CantonMUSDTransferProposal_Accept
+
+  m <- queryContractId bob newCid
+  case m of
+    Some mu -> assertMsg "owner" (mu.owner == bob)
+    None -> abort "Transfer failed"
+  pure ()
+
+test_CantonMUSDTransferReject : Script ()
+test_CantonMUSDTransferReject = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  musdCid <- createMUSD operator alice 1000.0
+
+  proposalCid <- submitMulti [alice] [operator] do
+    exerciseCmd musdCid CantonMUSD_Transfer with newOwner = bob; complianceRegistryCid = complianceCid
+
+  returnedCid <- submit bob do
+    exerciseCmd proposalCid CantonMUSDTransferProposal_Reject
+
+  m <- queryContractId alice returnedCid
+  case m of
+    Some mu -> assertMsg "returned" (mu.owner == alice)
+    None -> abort "Reject failed"
+  pure ()
+
+test_CantonMUSDTransferCancel : Script ()
+test_CantonMUSDTransferCancel = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  musdCid <- createMUSD operator alice 1000.0
+
+  proposalCid <- submitMulti [alice] [operator] do
+    exerciseCmd musdCid CantonMUSD_Transfer with newOwner = bob; complianceRegistryCid = complianceCid
+
+  returnedCid <- submit alice do
+    exerciseCmd proposalCid CantonMUSDTransferProposal_Cancel
+
+  m <- queryContractId alice returnedCid
+  case m of
+    Some mu -> assertMsg "cancelled" (mu.owner == alice)
+    None -> abort "Cancel failed"
+  pure ()
+
+test_CantonMUSDSplit : Script ()
+test_CantonMUSDSplit = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  musdCid <- createMUSD operator alice 1000.0
+
+  (c1, c2) <- submit alice do
+    exerciseCmd musdCid CantonMUSD_Split with splitAmount = 250.0
+
+  m1 <- queryContractId alice c1
+  m2 <- queryContractId alice c2
+  case (m1, m2) of
+    (Some a, Some b) -> do
+      assertMsg "part1" (a.amount == 250.0)
+      assertMsg "part2" (b.amount == 750.0)
+    _ -> abort "Split failed"
+  pure ()
+
+test_CantonMUSDMerge : Script ()
+test_CantonMUSDMerge = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  m1 <- createMUSD operator alice 300.0
+  m2 <- createMUSD operator alice 700.0
+
+  mergedCid <- submit alice do
+    exerciseCmd m1 CantonMUSD_Merge with otherCid = m2
+
+  m <- queryContractId alice mergedCid
+  case m of
+    Some mu -> assertMsg "merged" (mu.amount == 1000.0)
+    None -> abort "Merge failed"
+  pure ()
+
+test_BurnProposalAccept : Script ()
+test_BurnProposalAccept = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  musdCid <- createMUSD operator alice 500.0
+
+  musd <- queryContractId alice musdCid
+  let musdData = case musd of Some m -> m; None -> error "not found"
+
+  proposalCid <- submit operator do
+    createCmd CantonMUSDBurnProposal with musdCid; musd = musdData; reason = "compliance"
+
+  submit alice do exerciseCmd proposalCid CantonMUSDBurnProposal_Accept
+  result <- queryContractId alice musdCid
+  case result of Some _ -> abort "should be burned"; None -> pure ()
+  pure ()
+
+test_BurnProposalReject : Script ()
+test_BurnProposalReject = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  musdCid <- createMUSD operator alice 500.0
+  musd <- queryContractId alice musdCid
+  let musdData = case musd of Some m -> m; None -> error "not found"
+
+  proposalCid <- submit operator do
+    createCmd CantonMUSDBurnProposal with musdCid; musd = musdData; reason = "investigation"
+
+  submit alice do exerciseCmd proposalCid CantonMUSDBurnProposal_Reject
+  pure ()
+
+test_BurnProposalCancel : Script ()
+test_BurnProposalCancel = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  musdCid <- createMUSD operator alice 500.0
+  musd <- queryContractId alice musdCid
+  let musdData = case musd of Some m -> m; None -> error "not found"
+
+  proposalCid <- submit operator do
+    createCmd CantonMUSDBurnProposal with musdCid; musd = musdData; reason = "mistake"
+
+  submit operator do exerciseCmd proposalCid CantonMUSDBurnProposal_Cancel
+  pure ()
+
+-- ============================================================
+--         TEST 10: BRIDGE OUT — COMPLETE, FAIL, REFUND
+-- ============================================================
+
+test_BridgeOutComplete : Script ()
+test_BridgeOutComplete = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  svc <- createMintService operator operator complianceCid [alice]
+  usdcCid <- createUSDC operator alice 1000.0
+
+  (_, _, bridgeCid) <- submitMulti [alice] [operator] do
+    exerciseCmd svc DirectMint_Mint with user = alice; usdcCid
+
+  completedCid <- submit operator do
+    exerciseCmd bridgeCid BridgeOut_Complete with relayParty = operator
+
+  br <- queryContractId operator completedCid
+  case br of
+    Some b -> assertMsg "bridged" (b.status == "bridged")
+    None -> abort "not found"
+  pure ()
+
+test_BridgeOutFailAndRefund : Script ()
+test_BridgeOutFailAndRefund = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  svc <- createMintService operator operator complianceCid [alice]
+  usdcCid <- createUSDC operator alice 500.0
+
+  (_, _, bridgeCid) <- submitMulti [alice] [operator] do
+    exerciseCmd svc DirectMint_Mint with user = alice; usdcCid
+
+  failedCid <- submit operator do exerciseCmd bridgeCid BridgeOut_Fail
+
+  -- Verify failed status
+  br <- queryContractId operator failedCid
+  case br of
+    Some b -> assertMsg "failed" (b.status == "failed")
+    None -> abort "bridge not found"
+
+  -- NOTE: BridgeOut_Refund creates CantonUSDC (signatory issuer,owner) but the
+  -- user's authorization isn't available in the choice body (same limitation as
+  -- SupplyService_VaultMint). In production, this would need a propose-accept pattern.
+  -- Verify the fail state transition works correctly.
+  pure ()
+
+-- ============================================================
+--         TEST 11: RESERVE TRACKER
+-- ============================================================
+
+test_ReserveTracker : Script ()
+test_ReserveTracker = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+
+  t1 <- submitMulti [operator, governance] [] do
+    createCmd ReserveTracker with
+      operator; governance
+      totalDeposited = 0.0; totalRedeemed = 0.0
+      totalBridgedOut = 0.0; totalBridgedIn = 0.0
+      cantonMUSDSupply = 0.0; lastUpdated = now
+
+  t2 <- submitMulti [operator, governance] [] do
+    exerciseCmd t1 Reserve_RecordDeposit with depositAmount = 10000.0
+  t3 <- submitMulti [operator, governance] [] do
+    exerciseCmd t2 Reserve_RecordBridgeOut with bridgeAmount = 10000.0
+  t4 <- submitMulti [operator, governance] [] do
+    exerciseCmd t3 Reserve_RecordRedemption with redeemAmount = 5000.0
+  t5 <- submitMulti [operator, governance] [] do
+    exerciseCmd t4 Reserve_RecordBridgeIn with bridgeAmount = 5000.0
+
+  tr <- queryContractId operator t5
+  case tr of
+    Some t -> do
+      assertMsg "deposited" (t.totalDeposited == 10000.0)
+      assertMsg "redeemed" (t.totalRedeemed == 5000.0)
+      assertMsg "bridgedOut" (t.totalBridgedOut == 10000.0)
+      assertMsg "bridgedIn" (t.totalBridgedIn == 5000.0)
+      assertMsg "supply" (t.cantonMUSDSupply == 5000.0)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 12: BURN RATE LIMITER
+-- ============================================================
+
+test_BurnRateLimiter : Script ()
+test_BurnRateLimiter = script do
+  operator <- allocateParty "Operator"
+  now <- getTime
+
+  l1 <- submit operator do
+    createCmd BurnRateLimiter with
+      operator; dailyBurnLimit = 1000.0; dailyBurned = 0.0; lastResetTime = now
+
+  l2 <- submit operator do exerciseCmd l1 BurnLimit_RecordBurn with burnAmount = 500.0
+  l3 <- submit operator do exerciseCmd l2 BurnLimit_RecordBurn with burnAmount = 400.0
+  submitMustFail operator do exerciseCmd l3 BurnLimit_RecordBurn with burnAmount = 200.0
+  pure ()
+
+test_BurnRateLimiterUpdate : Script ()
+test_BurnRateLimiterUpdate = script do
+  operator <- allocateParty "Operator"
+  now <- getTime
+  l1 <- submit operator do
+    createCmd BurnRateLimiter with
+      operator; dailyBurnLimit = 100.0; dailyBurned = 0.0; lastResetTime = now
+
+  newCid <- submit operator do exerciseCmd l1 BurnLimit_UpdateLimit with newLimit = 5000.0
+  l <- queryContractId operator newCid
+  case l of
+    Some lim -> assertMsg "updated" (lim.dailyBurnLimit == 5000.0)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 13: GOVERNANCE-GATED ADMIN
+-- ============================================================
+
+test_GovernanceSupplyCapUpdate : Script ()
+test_GovernanceSupplyCapUpdate = script do
+  operator <- allocateParty "Operator"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  svc <- createMintService operator operator complianceCid []
+  govProof <- createGovProof operator SupplyCapChange "CantonDirectMint"
+
+  -- Advance time past 24h cooldown
+  setTime (time (date 1970 Jan 2) 1 0 0)
+
+  submit operator do
+    exerciseCmd svc DirectMint_UpdateSupplyCap with
+      newCap = 12000000.0; governanceProofCid = govProof
+  pure ()
+
+test_GovernanceDailyLimit : Script ()
+test_GovernanceDailyLimit = script do
+  operator <- allocateParty "Operator"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  svc <- createMintService operator operator complianceCid []
+  govProof <- createGovProof operator ParameterUpdate "CantonDirectMint"
+
+  submit operator do
+    exerciseCmd svc DirectMint_SetDailyMintLimit with
+      newLimit = 10000000.0; governanceProofCid = govProof
+  pure ()
+
+test_GovernanceWithdrawFees : Script ()
+test_GovernanceWithdrawFees = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  svc <- createMintService operator operator complianceCid [alice]
+
+  usdcCid <- createUSDC operator alice 10000.0
+  (svc2, _, _) <- submitMulti [alice] [operator] do
+    exerciseCmd svc DirectMint_Mint with user = alice; usdcCid
+
+  govProof <- createGovProof operator TreasuryWithdrawal "CantonDirectMint"
+  submit operator do
+    exerciseCmd svc2 DirectMint_WithdrawFees with governanceProofCid = govProof
+  pure ()
+
+test_WrongGovActionTypeFails : Script ()
+test_WrongGovActionTypeFails = script do
+  operator <- allocateParty "Operator"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  svc <- createMintService operator operator complianceCid []
+  govProof <- createGovProof operator ParameterUpdate "CantonDirectMint"
+
+  submitMustFail operator do
+    exerciseCmd svc DirectMint_UpdateSupplyCap with
+      newCap = 20000000.0; governanceProofCid = govProof
+  pure ()
+
+-- ============================================================
+--         TEST 14: REDEMPTION FULFILLMENT
+-- ============================================================
+
+test_RedemptionFulfill : Script ()
+test_RedemptionFulfill = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  svc <- createMintService operator operator complianceCid [alice]
+  usdcCid <- createUSDC operator alice 1000.0
+
+  (svc2, musdCid, _) <- submitMulti [alice] [operator] do
+    exerciseCmd svc DirectMint_Mint with user = alice; usdcCid
+
+  (svc3, redemptionCid) <- submitMulti [alice] [operator] do
+    exerciseCmd svc2 DirectMint_Redeem with user = alice; musdCid
+
+  r <- queryContractId alice redemptionCid
+  let owedAmount = case r of Some req -> req.usdcOwed; None -> error "not found"
+
+  fulfillUsdc <- createUSDC operator operator owedAmount
+  (_, payoutCid) <- submit operator do
+    exerciseCmd redemptionCid Redemption_Fulfill with usdcCid = fulfillUsdc; complianceRegistryCid = complianceCid
+
+  p <- queryContractId alice payoutCid
+  case p of
+    Some payout -> assertMsg "payout owner" (payout.owner == alice)
+    None -> abort "payout not found"
+  pure ()
+
+-- ============================================================
+--         TEST 15: NEGATIVE — BLACKLISTED CANNOT MINT
+-- ============================================================
+
+test_BlacklistedCannotMint : Script ()
+test_BlacklistedCannotMint = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  now <- getTime
+
+  complianceCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.fromList [alice]
+      frozen = Set.empty; lastUpdated = now
+
+  svc <- createMintService operator operator complianceCid [alice]
+  usdcCid <- createUSDC operator alice 1000.0
+  submitMustFail alice do
+    exerciseCmd svc DirectMint_Mint with user = alice; usdcCid
+  pure ()
+
+test_BelowMinFails : Script ()
+test_BelowMinFails = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  svc <- createMintService operator operator complianceCid [alice]
+  usdcCid <- createUSDC operator alice 0.5
+  submitMustFail alice do
+    exerciseCmd svc DirectMint_Mint with user = alice; usdcCid
+  pure ()
+
+-- ============================================================
+--         TEST 16: FULL LIFECYCLE
+-- ============================================================
+
+test_FullLifecycle : Script ()
+test_FullLifecycle = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  svc <- createMintService operator operator complianceCid [alice, bob]
+
+  -- 1. Alice mints 10,000 mUSD
+  usdcCid <- createUSDC operator alice 10000.0
+  (svc2, musdCid, bridgeCid) <- submitMulti [alice] [operator] do
+    exerciseCmd svc DirectMint_Mint with user = alice; usdcCid
+
+  -- 2. Bridge completes
+  submit operator do exerciseCmd bridgeCid BridgeOut_Complete with relayParty = operator
+
+  -- 3. Alice transfers mUSD to Bob
+  proposalCid <- submitMulti [alice] [operator] do
+    exerciseCmd musdCid CantonMUSD_Transfer with newOwner = bob; complianceRegistryCid = complianceCid
+
+  bobMusdCid <- submit bob do
+    exerciseCmd proposalCid CantonMUSDTransferProposal_Accept
+
+  -- 4. Bob redeems
+  (svc3, redemptionCid) <- submitMulti [bob] [operator] do
+    exerciseCmd svc2 DirectMint_Redeem with user = bob; musdCid = bobMusdCid
+
+  -- 5. Operator fulfills
+  r <- queryContractId bob redemptionCid
+  let owedAmount = case r of Some req -> req.usdcOwed; None -> error "not found"
+  fulfillUsdc <- createUSDC operator operator owedAmount
+  submit operator do
+    exerciseCmd redemptionCid Redemption_Fulfill with usdcCid = fulfillUsdc; complianceRegistryCid = complianceCid
+  pure ()
+
+-- ============================================================
+--         TEST 17: REDEEM FROM INVENTORY — HAPPY PATH
+-- ============================================================
+
+test_RedeemFromInventory : Script ()
+test_RedeemFromInventory = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  mintSvc <- createMintService operator operator complianceCid [alice]
+
+  -- Create operator-owned inventory (not tracked in currentSupply)
+  inv1 <- createMUSD operator operator 500.0
+  inv2 <- createMUSD operator operator 600.0
+
+  -- Alice redeems 800 mUSD from operator inventory
+  (svc2, redemptionCid) <- submitMulti [alice] [operator] do
+    exerciseCmd mintSvc DirectMint_RedeemFromInventory with
+      user = alice
+      inventoryMusdCids = [inv1, inv2]
+      redeemAmount = 800.0
+
+  -- Verify RedemptionRequest
+  r <- queryContractId alice redemptionCid
+  case r of
+    Some req -> do
+      assertMsg "user" (req.user == alice)
+      assertMsg "burned amount" (req.musdBurned == 800.0)
+      -- Fee: 800 * 30/10000 = 2.4, net = 797.6
+      assertMsg "usdc owed" (req.usdcOwed == 797.6)
+      assertMsg "fee" (req.feeAmount == 2.4)
+      assertMsg "not fulfilled" (not req.fulfilled)
+    None -> abort "RedemptionRequest not found"
+
+  -- Verify change returned to operator (1100 - 800 = 300)
+  operatorMusd <- query @CantonMUSD operator
+  let changeContracts = filter (\(_, m) -> m.owner == operator && m.amount == 300.0) operatorMusd
+  assertMsg "change returned" (length changeContracts == 1)
+
+  -- Verify original inventory is archived
+  inv1Check <- queryContractId operator inv1
+  inv2Check <- queryContractId operator inv2
+  assertMsg "inv1 archived" (inv1Check == None)
+  assertMsg "inv2 archived" (inv2Check == None)
+
+  -- SUPPLY INVARIANT: currentSupply must be unchanged (inventory was never tracked)
+  svc2Data <- queryContractId operator svc2
+  case svc2Data of
+    Some svc -> assertMsg "currentSupply unchanged" (svc.currentSupply == 0.0)
+    None -> abort "New service contract not found"
+  pure ()
+
+-- ============================================================
+--         TEST 18: REDEEM FROM INVENTORY — EXACT AMOUNT (NO CHANGE)
+-- ============================================================
+
+test_RedeemFromInventoryExact : Script ()
+test_RedeemFromInventoryExact = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  mintSvc <- createMintService operator operator complianceCid [alice]
+
+  inv1 <- createMUSD operator operator 500.0
+
+  -- Redeem exactly 500 — no change should be created
+  (_, redemptionCid) <- submitMulti [alice] [operator] do
+    exerciseCmd mintSvc DirectMint_RedeemFromInventory with
+      user = alice
+      inventoryMusdCids = [inv1]
+      redeemAmount = 500.0
+
+  r <- queryContractId alice redemptionCid
+  case r of
+    Some req -> assertMsg "burned amount" (req.musdBurned == 500.0)
+    None -> abort "RedemptionRequest not found"
+
+  -- No change contract should exist (operator had 500, redeemed 500)
+  operatorMusd <- query @CantonMUSD operator
+  let operatorOwned = filter (\(_, m) -> m.owner == operator) operatorMusd
+  assertMsg "no change created" (null operatorOwned)
+  pure ()
+
+-- ============================================================
+--         TEST 19: REDEEM FROM INVENTORY — INSUFFICIENT INVENTORY
+-- ============================================================
+
+test_RedeemFromInventoryInsufficient : Script ()
+test_RedeemFromInventoryInsufficient = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  mintSvc <- createMintService operator operator complianceCid [alice]
+
+  inv1 <- createMUSD operator operator 100.0
+
+  -- Try to redeem 500 from only 100 inventory — must fail
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd mintSvc DirectMint_RedeemFromInventory with
+      user = alice
+      inventoryMusdCids = [inv1]
+      redeemAmount = 500.0
+  pure ()
+
+-- ============================================================
+--         TEST 20: REDEEM FROM INVENTORY — WRONG OWNER (NOT OPERATOR)
+-- ============================================================
+
+test_RedeemFromInventoryWrongOwner : Script ()
+test_RedeemFromInventoryWrongOwner = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  mintSvc <- createMintService operator operator complianceCid [alice]
+
+  -- Create mUSD owned by Alice (not operator inventory)
+  aliceMusd <- createMUSD operator alice 500.0
+
+  -- Must fail: inventory tokens must be operator-owned
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd mintSvc DirectMint_RedeemFromInventory with
+      user = alice
+      inventoryMusdCids = [aliceMusd]
+      redeemAmount = 500.0
+  pure ()
+
+-- ============================================================
+--         TEST 21: REDEEM FROM INVENTORY — PAUSED SERVICE
+-- ============================================================
+
+test_RedeemFromInventoryPaused : Script ()
+test_RedeemFromInventoryPaused = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  mintSvc <- createMintService operator operator complianceCid [alice]
+
+  pausedSvc <- submit operator do
+    exerciseCmd mintSvc DirectMint_SetPaused with newPaused = True
+
+  inv1 <- createMUSD operator operator 500.0
+
+  -- Must fail: service is paused
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd pausedSvc DirectMint_RedeemFromInventory with
+      user = alice
+      inventoryMusdCids = [inv1]
+      redeemAmount = 500.0
+  pure ()
+
+-- ============================================================
+--         TEST 22: REDEEM FROM INVENTORY — BELOW MIN AMOUNT
+-- ============================================================
+
+test_RedeemFromInventoryBelowMin : Script ()
+test_RedeemFromInventoryBelowMin = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  mintSvc <- createMintService operator operator complianceCid [alice]
+
+  inv1 <- createMUSD operator operator 0.5
+
+  -- Must fail: redeemAmount 0.5 < minAmount 1.0
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd mintSvc DirectMint_RedeemFromInventory with
+      user = alice
+      inventoryMusdCids = [inv1]
+      redeemAmount = 0.5
+  pure ()
+
+-- ============================================================
+--         TEST 23: REDEEM FROM INVENTORY — EMPTY LIST
+-- ============================================================
+
+test_RedeemFromInventoryEmptyList : Script ()
+test_RedeemFromInventoryEmptyList = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  mintSvc <- createMintService operator operator complianceCid [alice]
+
+  -- Must fail: empty inventory list
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd mintSvc DirectMint_RedeemFromInventory with
+      user = alice
+      inventoryMusdCids = []
+      redeemAmount = 100.0
+  pure ()
+
+-- ============================================================
+--         TEST 24: REDEEM FROM INVENTORY — BLACKLISTED USER
+-- ============================================================
+
+test_RedeemFromInventoryBlacklisted : Script ()
+test_RedeemFromInventoryBlacklisted = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  now <- getTime
+
+  complianceCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.fromList [alice]
+      frozen = Set.empty; lastUpdated = now
+
+  mintSvc <- createMintService operator operator complianceCid [alice]
+  inv1 <- createMUSD operator operator 500.0
+
+  -- Must fail: alice is blacklisted
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd mintSvc DirectMint_RedeemFromInventory with
+      user = alice
+      inventoryMusdCids = [inv1]
+      redeemAmount = 500.0
+  pure ()
+
+-- ============================================================
+--         TEST 25: REDEEM FROM INVENTORY — MIXED OWNER LIST
+-- ============================================================
+
+test_RedeemFromInventoryMixedOwner : Script ()
+test_RedeemFromInventoryMixedOwner = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  mintSvc <- createMintService operator operator complianceCid [alice]
+
+  -- Create one operator-owned and one alice-owned mUSD
+  operatorInv <- createMUSD operator operator 500.0
+  aliceMusd <- createMUSD operator alice 500.0
+
+  -- Must fail: mixed list contains non-operator-owned token
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd mintSvc DirectMint_RedeemFromInventory with
+      user = alice
+      inventoryMusdCids = [operatorInv, aliceMusd]
+      redeemAmount = 800.0
+  pure ()
+
+-- ============================================================
+--         STAKE FROM INVENTORY TESTS
+-- ============================================================
+
+-- Helper: create a CantonStakingService for tests
+createStakingService : Party -> ContractId ComplianceRegistry -> [Party] -> Script (ContractId CantonStakingService)
+createStakingService operator complianceCid observers =
+  submit operator do
+    createCmd CantonStakingService with
+      operator
+      governance = operator
+      totalShares = 0.0
+      pooledMusd = 0.0
+      poolMusdCid = None
+      globalSharePrice = 1.0
+      globalTotalAssets = 0.0
+      globalTotalShares = 0.0
+      lastSyncEpoch = 0
+      cooldownSeconds = 0
+      minDeposit = 1.0
+      paused = False
+      complianceRegistryCid = complianceCid
+      mpaHash = testMpaHash
+      mpaUri = testMpaUri
+      observers
+
+-- ============================================================
+--         TEST 26: STAKE FROM INVENTORY — HAPPY PATH
+-- ============================================================
+
+test_StakeFromInventoryHappyPath : Script ()
+test_StakeFromInventoryHappyPath = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  stakingSvc <- createStakingService operator complianceCid [alice]
+
+  -- Create operator inventory
+  inv1 <- createMUSD operator operator 500.0
+  inv2 <- createMUSD operator operator 600.0
+
+  -- Alice stakes 800 from 1100 inventory → 300 change to operator
+  (svc2, smusdCid) <- submitMulti [alice] [operator] do
+    exerciseCmd stakingSvc StakeFromInventory with
+      user = alice
+      inventoryMusdCids = [inv1, inv2]
+      stakeAmount = 800.0
+
+  -- Verify smUSD position
+  smusd <- queryContractId alice smusdCid
+  case smusd of
+    Some s -> do
+      assertMsg "owner" (s.owner == alice)
+      assertMsg "shares" (s.shares == 800.0)  -- pool empty → sharePrice=1.0 → shares=amount
+      assertMsg "entry price" (s.entrySharePrice == 1.0)
+    None -> abort "smUSD not found"
+
+  -- Verify 300 change returned to operator
+  operatorMusd <- query @CantonMUSD operator
+  let changes = filter (\(_, m) -> m.owner == operator && m.amount == 300.0) operatorMusd
+  assertMsg "change returned" (length changes == 1)
+
+  -- POOL INVARIANT: pooledMusd = 800, totalShares = 800
+  svc <- queryContractId operator svc2
+  case svc of
+    Some s -> do
+      assertMsg "pooledMusd" (s.pooledMusd == 800.0)
+      assertMsg "totalShares" (s.totalShares == 800.0)
+    None -> abort "Service not found"
+  pure ()
+
+-- ============================================================
+--         TEST 27: STAKE FROM INVENTORY — EXACT AMOUNT (NO CHANGE)
+-- ============================================================
+
+test_StakeFromInventoryExact : Script ()
+test_StakeFromInventoryExact = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  stakingSvc <- createStakingService operator complianceCid [alice]
+
+  inv1 <- createMUSD operator operator 500.0
+
+  -- Stake exactly 500 → no change
+  (svc2, smusdCid) <- submitMulti [alice] [operator] do
+    exerciseCmd stakingSvc StakeFromInventory with
+      user = alice
+      inventoryMusdCids = [inv1]
+      stakeAmount = 500.0
+
+  smusd <- queryContractId alice smusdCid
+  case smusd of
+    Some s -> assertMsg "shares" (s.shares == 500.0)
+    None -> abort "smUSD not found"
+
+  -- Only operator-owned mUSD should be the pool (500). No separate change.
+  operatorMusd <- query @CantonMUSD operator
+  let operatorContracts = filter (\(_, m) -> m.owner == operator) operatorMusd
+  assertMsg "only pool mUSD exists" (length operatorContracts == 1)
+  pure ()
+
+-- ============================================================
+--         TEST 28: STAKE FROM INVENTORY — WRONG OWNER
+-- ============================================================
+
+test_StakeFromInventoryWrongOwner : Script ()
+test_StakeFromInventoryWrongOwner = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  stakingSvc <- createStakingService operator complianceCid [alice]
+
+  -- Create alice-owned mUSD (not operator inventory)
+  aliceMusd <- createMUSD operator alice 500.0
+
+  -- Must fail: inventory must be operator-owned
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd stakingSvc StakeFromInventory with
+      user = alice
+      inventoryMusdCids = [aliceMusd]
+      stakeAmount = 500.0
+  pure ()
+
+-- ============================================================
+--         TEST 29: STAKE FROM INVENTORY — MIXED OWNER
+-- ============================================================
+
+test_StakeFromInventoryMixedOwner : Script ()
+test_StakeFromInventoryMixedOwner = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  stakingSvc <- createStakingService operator complianceCid [alice]
+
+  opInv <- createMUSD operator operator 500.0
+  aliceMusd <- createMUSD operator alice 500.0
+
+  -- Must fail: mixed list
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd stakingSvc StakeFromInventory with
+      user = alice
+      inventoryMusdCids = [opInv, aliceMusd]
+      stakeAmount = 800.0
+  pure ()
+
+-- ============================================================
+--         TEST 30: STAKE FROM INVENTORY — INSUFFICIENT
+-- ============================================================
+
+test_StakeFromInventoryInsufficient : Script ()
+test_StakeFromInventoryInsufficient = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  stakingSvc <- createStakingService operator complianceCid [alice]
+
+  inv1 <- createMUSD operator operator 100.0
+
+  -- Must fail: 100 < 500
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd stakingSvc StakeFromInventory with
+      user = alice
+      inventoryMusdCids = [inv1]
+      stakeAmount = 500.0
+  pure ()
+
+-- ============================================================
+--         TEST 31: STAKE FROM INVENTORY — EMPTY LIST
+-- ============================================================
+
+test_StakeFromInventoryEmptyList : Script ()
+test_StakeFromInventoryEmptyList = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  stakingSvc <- createStakingService operator complianceCid [alice]
+
+  -- Must fail: empty list
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd stakingSvc StakeFromInventory with
+      user = alice
+      inventoryMusdCids = []
+      stakeAmount = 100.0
+  pure ()
+
+-- ============================================================
+--         TEST 32: STAKE FROM INVENTORY — BELOW MIN DEPOSIT
+-- ============================================================
+
+test_StakeFromInventoryBelowMin : Script ()
+test_StakeFromInventoryBelowMin = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  stakingSvc <- createStakingService operator complianceCid [alice]
+
+  inv1 <- createMUSD operator operator 0.5
+
+  -- Must fail: stakeAmount 0.5 < minDeposit 1.0
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd stakingSvc StakeFromInventory with
+      user = alice
+      inventoryMusdCids = [inv1]
+      stakeAmount = 0.5
+  pure ()
+
+-- ============================================================
+--         TEST 33: STAKE FROM INVENTORY — PAUSED SERVICE
+-- ============================================================
+
+test_StakeFromInventoryPaused : Script ()
+test_StakeFromInventoryPaused = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  complianceCid <- createCompliance regulator operator
+  stakingSvc <- createStakingService operator complianceCid [alice]
+
+  -- Pause the service (need to know the pause choice name)
+  -- CantonStakingService has a SetPaused choice
+  pausedSvc <- submit operator do
+    createCmd CantonStakingService with
+      operator
+      governance = operator
+      totalShares = 0.0
+      pooledMusd = 0.0
+      poolMusdCid = None
+      globalSharePrice = 1.0
+      globalTotalAssets = 0.0
+      globalTotalShares = 0.0
+      lastSyncEpoch = 0
+      cooldownSeconds = 0
+      minDeposit = 1.0
+      paused = True  -- paused!
+      complianceRegistryCid = complianceCid
+      mpaHash = testMpaHash
+      mpaUri = testMpaUri
+      observers = [alice]
+
+  inv1 <- createMUSD operator operator 500.0
+
+  -- Must fail: service is paused
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd pausedSvc StakeFromInventory with
+      user = alice
+      inventoryMusdCids = [inv1]
+      stakeAmount = 500.0
+  pure ()
+
+-- ============================================================
+--         TEST 34: STAKE FROM INVENTORY — BLACKLISTED USER
+-- ============================================================
+
+test_StakeFromInventoryBlacklisted : Script ()
+test_StakeFromInventoryBlacklisted = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  now <- getTime
+
+  -- Create compliance with alice blacklisted
+  complianceCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.fromList [alice]
+      frozen = Set.empty; lastUpdated = now
+
+  stakingSvc <- createStakingService operator complianceCid [alice]
+  inv1 <- createMUSD operator operator 500.0
+
+  -- Must fail: alice is blacklisted
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd stakingSvc StakeFromInventory with
+      user = alice
+      inventoryMusdCids = [inv1]
+      stakeAmount = 500.0
+  pure ()

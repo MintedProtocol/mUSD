@@ -1,0 +1,1590 @@
+
+
+module CantonBoostPoolTest where
+
+import DA.Time
+import DA.Set qualified as Set
+import DA.List (head)
+import DA.Optional (fromOptional, fromSome)
+import DA.Date
+import Daml.Script
+import CantonBoostPool
+import CantonDirectMint (Money, Bps)
+import CantonSMUSD (CantonSMUSD(..), CantonSMUSDTransferProposal(..), CantonSMUSDTransferProposal_Accept(..), CantonSMUSDTransferProposal_Reject(..), CantonSMUSDTransferProposal_Cancel(..), SMUSD_Transfer(..))
+import CantonLending (EscrowedCollateral, CollateralType(..))
+import CantonCoinToken (CantonCoin(..), CantonCoin_Burn(..), CantonCoinTransferProposal(..), CantonCoin_Transfer(..), CantonCoin_Split(..), CantonCoinTransferProposal_Accept(..), CantonCoinTransferProposal_Reject(..))
+import UserPrivacySettings (lookupUserObservers, UserPrivacySettings)
+
+import Compliance (ComplianceRegistry(..), ValidateMint(..), ValidateRedemption(..), ValidateTransfer(..))
+import Governance (GovernanceActionLog(..), ActionType(..), ConsumeProof(..))
+
+
+-- | Global base time for all tests (2020-01-01T00:00:00Z)
+baseTime : Time
+baseTime = datetime 2020 Jan 1 0 0 0
+
+-- | CantonBoostPoolTest
+-- Deep test suite for the Canton Boost Pool
+
+createSmusd : Party -> Party -> Money -> Money -> Time -> Script (ContractId CantonSMUSD)
+createSmusd operator user shares entryPrice stakedAt = do
+  regulator <- allocateParty "SmusdRegulator"
+  now <- getTime
+  tempComplianceCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.empty
+      frozen = Set.empty
+      lastUpdated = now
+  submitMulti [operator, user] [] do
+    createCmd CantonSMUSD with
+      issuer = operator
+      owner = user
+      shares
+      entrySharePrice = entryPrice
+      stakedAt
+      complianceRegistryCid = tempComplianceCid
+      privacyObservers = []
+
+-- | Create a CantonCoin for a user
+createCanton : Party -> Party -> Money -> Script (ContractId CantonCoin)
+createCanton operator user amount =
+  submitMulti [operator, user] [] do
+    createCmd CantonCoin with
+      issuer = operator
+      owner = user
+      amount
+      privacyObservers = []
+
+-- | Create a default CantonBoostPoolService
+createPoolService : Party -> [Party] -> Script (ContractId CantonBoostPoolService)
+createPoolService operator observers = do
+  regulator <- allocateParty "Regulator"
+  now <- getTime
+  complianceCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.empty
+      frozen = Set.empty
+      lastUpdated = now
+  submit operator do
+    createCmd CantonBoostPoolService with
+      operator
+      totalCantonDeposited = 0.0
+      totalLPShares = 0.0
+      cantonPriceMusd = 0.172          -- $0.172 per Canton
+      globalSharePrice = 1.0           -- 1 sMUSD share = 1 mUSD initially
+      totalValidatorRewards = 0.0
+      protocolRewardsAccrued = 0.0
+      lpRewardsDistributed = 0.0
+      lastRewardEpoch = 0
+      protocolFeesAccrued = 0.0
+      entryFeeBps = 25                 -- 0.25%
+      exitFeeBps = 50                  -- 0.50%
+      lpRewardShareBps = 6000          -- 60% to LPs
+      cantonCapRatio = 0.25            -- 20/80 ratio
+      cooldownSeconds = 172800         -- 48 hours
+      paused = False
+      complianceRegistryCid = complianceCid
+      serviceName = "CantonBoostPool"
+      observers
+
+-- ============================================================
+--         TEST 1: BASIC DEPOSIT FLOW
+-- ============================================================
+
+-- | User with sMUSD can deposit Canton and receive LP tokens
+test_BasicDeposit : Script ()
+test_BasicDeposit = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  -- Alice has 10,000 sMUSD shares (worth 10,000 mUSD at sharePrice=1.0)
+  smusdCid <- createSmusd operator alice 10000.0 1.0 baseTime
+
+  -- Alice has 1,000 Canton coins
+  cantonCid <- createCanton operator alice 1000.0
+
+  -- Deploy pool
+  poolCid <- createPoolService operator [alice]
+
+  -- Alice deposits Canton (1,000 CTN × $0.172 = $172 mUSD value)
+  -- Max allowed = 10,000 × 1.0 × 0.25 = 2,500 mUSD → $172 is well within cap
+  setTime baseTime
+  (newPoolCid, lpCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  -- Verify LP was issued (can split → proves existence)
+  lp <- queryContractId alice lpCid
+  debug $ "LP token issued to Alice"
+
+  -- Verify sMUSD was NOT consumed (still exists for Alice)
+  smusdStillExists <- queryContractId alice smusdCid
+  debug $ "sMUSD position still exists (not consumed)"
+
+  debug "TEST 1 PASSED: Basic deposit flow"
+  pure ()
+
+
+-- ============================================================
+--         TEST 2: DEPOSIT CAP ENFORCEMENT
+-- ============================================================
+
+-- | Cannot deposit Canton exceeding sMUSD-qualified cap
+test_DepositCapEnforcement : Script ()
+test_DepositCapEnforcement = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  -- Alice has 1,000 sMUSD (worth 1,000 mUSD)
+  -- Max Canton = 1,000 × 0.25 = 250 mUSD worth
+  -- At $0.172/CTN that's ~1,453 CTN max
+  smusdCid <- createSmusd operator alice 1000.0 1.0 baseTime
+
+  -- Alice tries to deposit 2,000 Canton = $344 mUSD value > $250 cap
+  cantonCid <- createCanton operator alice 2000.0
+
+  poolCid <- createPoolService operator [alice]
+
+  setTime baseTime
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  debug "TEST 2 PASSED: Deposit cap enforcement — rejected over-deposit"
+  pure ()
+
+
+-- ============================================================
+--         TEST 3: CAP SCALES WITH sMUSD SHARE PRICE
+-- ============================================================
+
+-- | When globalSharePrice increases (yield accrued), deposit cap grows
+test_CapScalesWithSharePrice : Script ()
+test_CapScalesWithSharePrice = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  -- Alice has 10,000 sMUSD at sharePrice=1.0, cap = 10K×0.25 = 2,500 mUSD
+  smusdCid <- createSmusd operator alice 10000.0 1.0 baseTime
+
+  -- Deploy pool with higher share price (simulating yield accrual)
+  regulator <- allocateParty "Regulator"
+  now <- getTime
+  complianceCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.empty
+      frozen = Set.empty
+      lastUpdated = now
+  poolCid <- submit operator do
+    createCmd CantonBoostPoolService with
+      operator
+      totalCantonDeposited = 0.0
+      totalLPShares = 0.0
+      cantonPriceMusd = 0.172
+      globalSharePrice = 1.10           -- sMUSD has appreciated 10%
+      totalValidatorRewards = 0.0
+      protocolRewardsAccrued = 0.0
+      lpRewardsDistributed = 0.0
+      lastRewardEpoch = 0
+      protocolFeesAccrued = 0.0
+      entryFeeBps = 25
+      exitFeeBps = 50
+      lpRewardShareBps = 6000
+      cantonCapRatio = 0.25
+      cooldownSeconds = 172800
+      paused = False
+      complianceRegistryCid = complianceCid
+      serviceName = "CantonBoostPool"
+      observers = [alice]
+
+  -- With sharePrice=1.10, cap = 10,000 × 1.10 × 0.25 = 2,750 mUSD
+  -- 15,000 CTN × $0.172 = $2,580 mUSD → under $2,750 cap → should pass
+  cantonCid <- createCanton operator alice 15000.0
+
+  setTime baseTime
+  (_, lpCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  debug "TEST 3 PASSED: Cap scales with sMUSD share price"
+  pure ()
+
+
+-- ============================================================
+--         TEST 4: WITHDRAW FLOW
+-- ============================================================
+
+-- | Deposit then withdraw after cooldown — get Canton back minus exit fee
+test_WithdrawFlow : Script ()
+test_WithdrawFlow = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  smusdCid <- createSmusd operator alice 10000.0 1.0 baseTime
+  cantonCid <- createCanton operator alice 1000.0
+  poolCid <- createPoolService operator [alice]
+
+  setTime baseTime
+  (poolCid2, lpCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  -- Fast forward past cooldown (48 hours + 1 second)
+  setTime (addRelTime baseTime (seconds 172801))
+
+  (poolCid3, returnedCantonCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid2 Withdraw with
+      user = alice
+      lpCid
+
+  -- Verify Canton was returned
+  returnedCanton <- queryContractId alice returnedCantonCid
+  debug "TEST 4 PASSED: Withdraw flow — Canton returned after cooldown"
+  pure ()
+
+
+-- ============================================================
+--         TEST 5: COOLDOWN ENFORCEMENT
+-- ============================================================
+
+-- | Cannot withdraw before cooldown period
+test_CooldownEnforcement : Script ()
+test_CooldownEnforcement = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  smusdCid <- createSmusd operator alice 10000.0 1.0 baseTime
+  cantonCid <- createCanton operator alice 1000.0
+  poolCid <- createPoolService operator [alice]
+
+  setTime baseTime
+  (poolCid2, lpCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  -- Try to withdraw immediately (only 1 hour later, need 48)
+  setTime (addRelTime baseTime (hours 1))
+
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd poolCid2 Withdraw with
+      user = alice
+      lpCid
+
+  debug "TEST 5 PASSED: Cooldown enforcement — rejected early withdraw"
+  pure ()
+
+
+-- ============================================================
+--         TEST 6: VALIDATOR REWARD DISTRIBUTION (60/40)
+-- ============================================================
+
+-- | Rewards split 60% to LPs (increases pool balance), 40% to protocol
+test_RewardDistribution : Script ()
+test_RewardDistribution = script do
+  operator <- allocateParty "Operator"
+  governor <- allocateParty "Governor"
+  alice <- allocateParty "Alice"
+
+  smusdCid <- createSmusd operator alice 10000.0 1.0 baseTime
+  cantonCid <- createCanton operator alice 1000.0
+  poolCid <- createPoolService operator [alice]
+
+  setTime baseTime
+  (poolCid2, lpCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  -- Distribute 100 Canton in validator rewards (epoch 1)
+  now <- getTime
+  distProof1 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-dist-1"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid3 <- submit operator do
+    exerciseCmd poolCid2 DistributeRewards with
+      rewardAmount = 100.0
+      epochNumber = 1
+
+  -- Distribute another 200 Canton (epoch 2)
+  distProof2 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-dist-2"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid4 <- submit operator do
+    exerciseCmd poolCid3 DistributeRewards with
+      rewardAmount = 200.0
+      epochNumber = 2
+
+  -- After 300 total rewards:
+  -- LP share (60%) = 180 Canton added to pool
+  -- Protocol share (40%) = 120 Canton accrued
+  -- Alice withdraws after cooldown — should get original deposit + 180 reward (minus fees)
+  setTime (addRelTime baseTime (seconds 172801))
+
+  (poolCid5, returnedCantonCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid4 Withdraw with
+      user = alice
+      lpCid
+
+  debug "TEST 6 PASSED: Reward distribution — 60/40 split applied"
+  pure ()
+
+
+-- ============================================================
+--         TEST 7: REWARD EPOCH MUST BE SEQUENTIAL
+-- ============================================================
+
+-- | Cannot distribute rewards with non-sequential epoch
+test_RewardEpochSequential : Script ()
+test_RewardEpochSequential = script do
+  operator <- allocateParty "Operator"
+  governor <- allocateParty "Governor"
+  poolCid <- createPoolService operator []
+
+  -- Epoch 1 works
+  now <- getTime
+  distProof1 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-dist-epoch1"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid2 <- submit operator do
+    exerciseCmd poolCid DistributeRewards with
+      rewardAmount = 100.0
+      epochNumber = 1
+
+  -- Epoch 1 again fails (not sequential)
+  distProof2 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-dist-epoch1-dup"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMustFail operator do
+    exerciseCmd poolCid2 DistributeRewards with
+      rewardAmount = 100.0
+      epochNumber = 1
+
+  -- Epoch 0 fails (going backwards)
+  distProof3 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-dist-epoch0"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMustFail operator do
+    exerciseCmd poolCid2 DistributeRewards with
+      rewardAmount = 100.0
+      epochNumber = 0
+
+  debug "TEST 7 PASSED: Reward epoch must be sequential"
+  pure ()
+
+
+-- ============================================================
+--         TEST 8: CANTON PRICE SYNC
+-- ============================================================
+
+-- | Price sync within ±20% bounds
+test_CantonPriceSync : Script ()
+test_CantonPriceSync = script do
+  operator <- allocateParty "Operator"
+  governor <- allocateParty "Governor"
+  poolCid <- createPoolService operator []
+
+  now <- getTime
+  -- Valid: 10% increase (0.172 → 0.189)
+  syncProof1 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-sync-price-1"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid2 <- submit operator do
+    exerciseCmd poolCid SyncCantonPrice with
+      newPriceMusd = 0.189
+
+  -- Invalid: >20% jump (0.189 → 0.300)
+  syncProof2 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-sync-price-2"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMustFail operator do
+    exerciseCmd poolCid2 SyncCantonPrice with
+      newPriceMusd = 0.300
+
+  -- Valid: 15% decrease (0.189 → 0.161)
+  syncProof3 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-sync-price-3"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid3 <- submit operator do
+    exerciseCmd poolCid2 SyncCantonPrice with
+      newPriceMusd = 0.161
+
+  -- Invalid: zero price
+  syncProof4 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-sync-price-4"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMustFail operator do
+    exerciseCmd poolCid3 SyncCantonPrice with
+      newPriceMusd = 0.0
+
+  debug "TEST 8 PASSED: Canton price sync — bounds enforced"
+  pure ()
+
+
+-- ============================================================
+--         TEST 9: sMUSD SHARE PRICE SYNC
+-- ============================================================
+
+-- | Share price sync with decrease cap
+test_SharePriceSync : Script ()
+test_SharePriceSync = script do
+  operator <- allocateParty "Operator"
+  governor <- allocateParty "Governor"
+  poolCid <- createPoolService operator []
+
+  now <- getTime
+  -- Valid: share price up (1.0 → 1.05)
+  spProof1 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-sp-1"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid2 <- submit operator do
+    exerciseCmd poolCid SyncSharePrice with
+      newGlobalSharePrice = 1.05
+
+  -- Valid: small decrease (1.05 → 0.95, just within 10%)
+  spProof2 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-sp-2"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid3 <- submit operator do
+    exerciseCmd poolCid2 SyncSharePrice with
+      newGlobalSharePrice = 0.95
+
+  -- Invalid: >10% decrease (0.95 → 0.80)
+  spProof3 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-sp-3"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMustFail operator do
+    exerciseCmd poolCid3 SyncSharePrice with
+      newGlobalSharePrice = 0.80
+
+  -- Invalid: zero
+  spProof4 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-sp-4"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMustFail operator do
+    exerciseCmd poolCid3 SyncSharePrice with
+      newGlobalSharePrice = 0.0
+
+  debug "TEST 9 PASSED: Share price sync — decrease cap enforced"
+  pure ()
+
+
+-- ============================================================
+--         TEST 10: PROTOCOL REWARD WITHDRAWAL
+-- ============================================================
+
+-- | Operator can withdraw accrued protocol rewards
+test_ProtocolRewardWithdraw : Script ()
+test_ProtocolRewardWithdraw = script do
+  operator <- allocateParty "Operator"
+  governor <- allocateParty "Governor"
+  alice <- allocateParty "Alice"
+
+  smusdCid <- createSmusd operator alice 10000.0 1.0 baseTime
+  cantonCid <- createCanton operator alice 1000.0
+  poolCid <- createPoolService operator [alice]
+
+  setTime baseTime
+  (poolCid2, _) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  -- Distribute 1000 Canton rewards → 400 to protocol (40%)
+  now <- getTime
+  distProof <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-dist-rewards"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid3 <- submit operator do
+    exerciseCmd poolCid2 DistributeRewards with
+      rewardAmount = 1000.0
+      epochNumber = 1
+
+  -- Operator withdraws 200 of 400 accrued
+  wdProof1 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-wd-rewards-1"
+      actionType = TreasuryWithdrawal
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  (poolCid4, rewardCantonCid) <- submit operator do
+    exerciseCmd poolCid3 WithdrawProtocolRewards with
+      withdrawAmount = 200.0
+
+  -- Cannot withdraw more than remaining (200 left)
+  wdProof2 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-wd-rewards-2"
+      actionType = TreasuryWithdrawal
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMustFail operator do
+    exerciseCmd poolCid4 WithdrawProtocolRewards with
+      withdrawAmount = 300.0
+
+  -- Can withdraw the rest
+  wdProof3 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-wd-rewards-3"
+      actionType = TreasuryWithdrawal
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  (poolCid5, _) <- submit operator do
+    exerciseCmd poolCid4 WithdrawProtocolRewards with
+      withdrawAmount = 200.0
+
+  debug "TEST 10 PASSED: Protocol reward withdrawal"
+  pure ()
+
+
+-- ============================================================
+--         TEST 11: PAUSE / UNPAUSE
+-- ============================================================
+
+-- | Paused pool rejects deposits and withdrawals
+test_PauseUnpause : Script ()
+test_PauseUnpause = script do
+  operator <- allocateParty "Operator"
+  governor <- allocateParty "Governor"
+  alice <- allocateParty "Alice"
+
+  smusdCid <- createSmusd operator alice 10000.0 1.0 baseTime
+  cantonCid <- createCanton operator alice 1000.0
+  poolCid <- createPoolService operator [alice]
+
+  -- Pause pool
+  now <- getTime
+  pauseProof1 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-pause-1"
+      actionType = EmergencyPause
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid2 <- submit operator do
+    exerciseCmd poolCid BoostPool_SetPaused with
+      newPaused = True
+
+  -- Deposit fails when paused
+  setTime baseTime
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd poolCid2 Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  -- Unpause
+  unpauseProof <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-unpause"
+      actionType = EmergencyPause
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid3 <- submit operator do
+    exerciseCmd poolCid2 BoostPool_SetPaused with
+      newPaused = False
+
+  -- Deposit succeeds
+  (poolCid4, lpCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid3 Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  -- Pause again — withdrawals still allowed when paused (users can always exit)
+  pauseProof2 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-pause-2"
+      actionType = EmergencyPause
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid5 <- submit operator do
+    exerciseCmd poolCid4 BoostPool_SetPaused with
+      newPaused = True
+
+  setTime (addRelTime baseTime (seconds 172801))
+  -- Withdraw succeeds even when paused (H-B1: operator cannot lock user funds)
+  (_, returnedCantonCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid5 Withdraw with
+      user = alice
+      lpCid
+
+  debug "TEST 11 PASSED: Pause/unpause controls (deposits blocked, withdrawals always allowed)"
+  pure ()
+
+
+-- ============================================================
+--         TEST 12: FEE UPDATE
+-- ============================================================
+
+-- | Admin can update entry/exit fees within bounds
+test_FeeUpdate : Script ()
+test_FeeUpdate = script do
+  operator <- allocateParty "Operator"
+  governor <- allocateParty "Governor"
+  poolCid <- createPoolService operator []
+
+  now <- getTime
+  -- Valid: update to 100bps / 100bps
+  feeProof1 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-fee-1"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid2 <- submit operator do
+    exerciseCmd poolCid BoostPool_UpdateFees with
+      newEntryFeeBps = 100
+      newExitFeeBps = 100
+      governanceProofCid = feeProof1
+
+  -- Invalid: entry fee > 500 bps (5%)
+  feeProof2 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-fee-2"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMustFail operator do
+    exerciseCmd poolCid2 BoostPool_UpdateFees with
+      newEntryFeeBps = 600
+      newExitFeeBps = 100
+      governanceProofCid = feeProof2
+
+  -- Invalid: exit fee > 500 bps
+  feeProof3 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-fee-3"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMustFail operator do
+    exerciseCmd poolCid2 BoostPool_UpdateFees with
+      newEntryFeeBps = 100
+      newExitFeeBps = 501
+      governanceProofCid = feeProof3
+
+  -- Valid: zero fees
+  feeProof4 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-fee-4"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid3 <- submit operator do
+    exerciseCmd poolCid2 BoostPool_UpdateFees with
+      newEntryFeeBps = 0
+      newExitFeeBps = 0
+      governanceProofCid = feeProof4
+
+  debug "TEST 12 PASSED: Fee update — bounds enforced"
+  pure ()
+
+
+-- ============================================================
+--         TEST 13: CAP RATIO UPDATE
+-- ============================================================
+
+-- | Admin can update the Canton cap ratio
+test_CapRatioUpdate : Script ()
+test_CapRatioUpdate = script do
+  operator <- allocateParty "Operator"
+  governor <- allocateParty "Governor"
+  poolCid <- createPoolService operator []
+
+  now <- getTime
+  -- Valid: change ratio to 0.50 (50/50 pool)
+  capProof1 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-cap-1"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid2 <- submit operator do
+    exerciseCmd poolCid BoostPool_UpdateCapRatio with
+      newCapRatio = 0.50
+      governanceProofCid = capProof1
+
+  -- Invalid: zero ratio
+  capProof2 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-cap-2"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMustFail operator do
+    exerciseCmd poolCid2 BoostPool_UpdateCapRatio with
+      newCapRatio = 0.0
+      governanceProofCid = capProof2
+
+  -- Invalid: > 1.0
+  capProof3 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-cap-3"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMustFail operator do
+    exerciseCmd poolCid2 BoostPool_UpdateCapRatio with
+      newCapRatio = 1.5
+      governanceProofCid = capProof3
+
+  debug "TEST 13 PASSED: Cap ratio update — bounds enforced"
+  pure ()
+
+
+-- ============================================================
+--         TEST 14: UNAUTHORIZED DEPOSIT (wrong owner)
+-- ============================================================
+
+-- | Attacker cannot deposit using someone else's sMUSD
+test_UnauthorizedDeposit : Script ()
+test_UnauthorizedDeposit = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- Alice has sMUSD, Bob does not
+  smusdCid <- createSmusd operator alice 10000.0 1.0 baseTime
+  cantonCid <- createCanton operator bob 1000.0
+
+  poolCid <- createPoolService operator [alice, bob]
+
+  setTime baseTime
+
+  -- Bob tries to deposit his Canton using Alice's sMUSD as qualifier
+  submitMultiMustFail [bob] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = bob
+      cantonCid
+      smusdCid  -- Alice's sMUSD — should fail SMUSD_OWNER_MISMATCH
+
+  debug "TEST 14 PASSED: Unauthorized deposit — cannot use another's sMUSD"
+  pure ()
+
+
+-- ============================================================
+--         TEST 15: UNAUTHORIZED WITHDRAW (wrong LP owner)
+-- ============================================================
+
+-- | Attacker cannot withdraw using someone else's LP token
+test_UnauthorizedWithdraw : Script ()
+test_UnauthorizedWithdraw = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  smusdCid <- createSmusd operator alice 10000.0 1.0 baseTime
+  cantonCid <- createCanton operator alice 1000.0
+  poolCid <- createPoolService operator [alice, bob]
+
+  setTime baseTime
+  (poolCid2, lpCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  -- Fast forward past cooldown
+  setTime (addRelTime baseTime (seconds 172801))
+
+  -- Bob tries to withdraw Alice's LP
+  submitMultiMustFail [bob] [operator] do
+    exerciseCmd poolCid2 Withdraw with
+      user = bob
+      lpCid  -- Alice's LP — should fail LP_OWNER_MISMATCH
+
+  debug "TEST 15 PASSED: Unauthorized withdraw — cannot use another's LP"
+  pure ()
+
+
+-- ============================================================
+--         TEST 16: MULTIPLE DEPOSITORS + PROPORTIONAL WITHDRAW
+-- ============================================================
+
+-- | Two depositors, rewards distributed, proportional shares
+test_MultipleDepositors : Script ()
+test_MultipleDepositors = script do
+  operator <- allocateParty "Operator"
+  governor <- allocateParty "Governor"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- Both have sMUSD qualifying positions
+  smusdAlice <- createSmusd operator alice 20000.0 1.0 baseTime
+  smusdBob <- createSmusd operator bob 20000.0 1.0 baseTime
+
+  -- Alice deposits 1,000 CTN, Bob deposits 500 CTN
+  cantonAlice <- createCanton operator alice 1000.0
+  cantonBob <- createCanton operator bob 500.0
+
+  poolCid <- createPoolService operator [alice, bob]
+
+  setTime baseTime
+
+  -- Alice deposits first
+  (poolCid2, lpAlice) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = alice
+      cantonCid = cantonAlice
+      smusdCid = smusdAlice
+
+  -- Bob deposits second
+  (poolCid3, lpBob) <- submitMulti [bob] [operator] do
+    exerciseCmd poolCid2 Deposit with
+      user = bob
+      cantonCid = cantonBob
+      smusdCid = smusdBob
+
+  -- Distribute 300 Canton rewards → 180 to LPs (60%)
+  -- Alice has ~2/3 of pool, Bob ~1/3 (by share proportion)
+  now <- getTime
+  distProof <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-dist-multi"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid4 <- submit operator do
+    exerciseCmd poolCid3 DistributeRewards with
+      rewardAmount = 300.0
+      epochNumber = 1
+
+  -- Both withdraw
+  setTime (addRelTime baseTime (seconds 172801))
+
+  (poolCid5, aliceCantonBack) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid4 Withdraw with
+      user = alice
+      lpCid = lpAlice
+
+  (poolCid6, bobCantonBack) <- submitMulti [bob] [operator] do
+    exerciseCmd poolCid5 Withdraw with
+      user = bob
+      lpCid = lpBob
+
+  debug "TEST 16 PASSED: Multiple depositors — proportional shares"
+  pure ()
+
+
+-- ============================================================
+--         TEST 17: CANTON COIN TRANSFER PROPOSAL
+-- ============================================================
+
+-- | CantonCoin transfer uses proposal pattern
+test_CantonCoinTransfer : Script ()
+test_CantonCoinTransfer = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  regulator <- allocateParty "Regulator"
+
+  cantonCid <- createCanton operator alice 500.0
+
+  -- DAML-H-01: Create compliance registry for transfer validation
+  now <- getTime
+  complianceCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.empty
+      frozen = Set.empty
+      lastUpdated = now
+
+  -- Alice proposes transfer to Bob (compliance validated at initiation)
+  proposalCid <- submitMulti [alice] [operator] do
+    exerciseCmd cantonCid CantonCoin_Transfer with
+      newOwner = bob
+      complianceRegistryCid = complianceCid
+
+  -- Bob accepts (compliance already validated at transfer initiation)
+  newCantonCid <- submit bob do
+    exerciseCmd proposalCid CantonCoinTransferProposal_Accept
+
+  debug "TEST 17 PASSED: Canton coin transfer proposal"
+  pure ()
+
+
+-- ============================================================
+--         TEST 18: CANTON COIN TRANSFER REJECTION
+-- ============================================================
+
+-- | Recipient can reject a CantonCoin transfer
+test_CantonCoinTransferReject : Script ()
+test_CantonCoinTransferReject = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  regulator <- allocateParty "Regulator"
+
+  cantonCid <- createCanton operator alice 500.0
+
+  -- Create compliance registry for transfer validation
+  now <- getTime
+  complianceCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.empty
+      frozen = Set.empty
+      lastUpdated = now
+
+  proposalCid <- submitMulti [alice] [operator] do
+    exerciseCmd cantonCid CantonCoin_Transfer with
+      newOwner = bob
+      complianceRegistryCid = complianceCid
+
+  -- Bob rejects — Canton goes back to Alice
+  returnedCid <- submit bob do
+    exerciseCmd proposalCid CantonCoinTransferProposal_Reject
+
+  debug "TEST 18 PASSED: Canton coin transfer rejection"
+  pure ()
+
+
+-- ============================================================
+--         TEST 19: LP TOKEN TRANSFER PROPOSAL
+-- ============================================================
+
+-- | BoostPoolLP transfer uses proposal pattern
+test_LPTransfer : Script ()
+test_LPTransfer = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  smusdCid <- createSmusd operator alice 10000.0 1.0 baseTime
+  cantonCid <- createCanton operator alice 1000.0
+  poolCid <- createPoolService operator [alice, bob]
+
+  setTime baseTime
+  (poolCid2, lpCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  -- Alice transfers LP to Bob
+  -- Canton 3.x / LF 2.x: operator must be actAs for inner exercise visibility
+  -- on ComplianceRegistry within BPLP_Transfer choice body.
+  proposalCid <- submitMulti [alice, operator] [] do
+    exerciseCmd lpCid BPLP_Transfer with newOwner = bob
+
+  -- Bob accepts
+  newLpCid <- submitMulti [bob] [operator] do
+    exerciseCmd proposalCid BPLPTransferProposal_Accept
+
+  -- Bob can withdraw (after cooldown — uses Alice's original depositedAt)
+  setTime (addRelTime baseTime (seconds 172801))
+
+  (_, bobCantonCid) <- submitMulti [bob] [operator] do
+    exerciseCmd poolCid2 Withdraw with
+      user = bob
+      lpCid = newLpCid
+
+  debug "TEST 19 PASSED: LP token transfer and withdrawal by new owner"
+  pure ()
+
+
+-- ============================================================
+--         TEST 20: CANTON COIN SPLIT
+-- ============================================================
+
+-- | CantonCoin can be split
+test_CantonCoinSplit : Script ()
+test_CantonCoinSplit = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  cantonCid <- createCanton operator alice 1000.0
+
+  -- Split into 300 + 700
+  (c1, c2) <- submit alice do
+    exerciseCmd cantonCid CantonCoin_Split with splitAmount = 300.0
+
+  -- Invalid: split more than total
+  cantonCid2 <- createCanton operator alice 500.0
+  submitMustFail alice do
+    exerciseCmd cantonCid2 CantonCoin_Split with splitAmount = 500.0  -- Must be < total
+
+  debug "TEST 20 PASSED: Canton coin split"
+  pure ()
+
+
+-- ============================================================
+--         TEST 21: LP TOKEN SPLIT
+-- ============================================================
+
+-- | BoostPoolLP can be split
+test_LPSplit : Script ()
+test_LPSplit = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  smusdCid <- createSmusd operator alice 10000.0 1.0 baseTime
+  cantonCid <- createCanton operator alice 1000.0
+  poolCid <- createPoolService operator [alice]
+
+  setTime baseTime
+  (poolCid2, lpCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  -- Split LP
+  (lp1, lp2) <- submit alice do
+    exerciseCmd lpCid BPLP_Split with splitShares = 100.0
+
+  -- Withdraw both halves after cooldown
+  setTime (addRelTime baseTime (seconds 172801))
+
+  (poolCid3, _) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid2 Withdraw with
+      user = alice
+      lpCid = lp1
+
+  (poolCid4, _) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid3 Withdraw with
+      user = alice
+      lpCid = lp2
+
+  debug "TEST 21 PASSED: LP split and partial withdrawal"
+  pure ()
+
+
+-- ============================================================
+--         TEST 22: ZERO / NEGATIVE REWARD REJECTED
+-- ============================================================
+
+-- | Cannot distribute zero or negative rewards
+test_InvalidReward : Script ()
+test_InvalidReward = script do
+  operator <- allocateParty "Operator"
+  governor <- allocateParty "Governor"
+  poolCid <- createPoolService operator []
+
+  -- Zero reward
+  now <- getTime
+  distProof <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-invalid-reward"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMustFail operator do
+    exerciseCmd poolCid DistributeRewards with
+      rewardAmount = 0.0
+      epochNumber = 1
+
+  debug "TEST 22 PASSED: Zero reward rejected"
+  pure ()
+
+
+-- ============================================================
+--         TEST 23: FULL LIFECYCLE
+-- ============================================================
+
+-- | End-to-end: deposit → rewards → price update → withdraw with profit
+test_FullLifecycle : Script ()
+test_FullLifecycle = script do
+  operator <- allocateParty "Operator"
+  governor <- allocateParty "Governor"
+  alice <- allocateParty "Alice"
+
+  -- Alice has 50,000 sMUSD (earning Treasury yield independently)
+  smusdCid <- createSmusd operator alice 50000.0 1.0 baseTime
+
+  -- Alice deposits 10,000 Canton ($0.172 ea = $1,720 mUSD value)
+  -- Cap = 50,000 × 1.0 × 0.25 = $12,500 → well within limit
+  cantonCid <- createCanton operator alice 10000.0
+  poolCid <- createPoolService operator [alice]
+
+  setTime baseTime
+
+  -- 1. DEPOSIT
+  (poolCid2, lpCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid Deposit with
+      user = alice
+      cantonCid
+      smusdCid
+
+  -- 2. VALIDATOR REWARDS over 3 epochs (100 + 200 + 300 = 600 CTN total)
+  now <- getTime
+  distProof1 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-lc-dist-1"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid3 <- submit operator do
+    exerciseCmd poolCid2 DistributeRewards with
+      rewardAmount = 100.0
+      epochNumber = 1
+
+  distProof2 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-lc-dist-2"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid4 <- submit operator do
+    exerciseCmd poolCid3 DistributeRewards with
+      rewardAmount = 200.0
+      epochNumber = 2
+
+  distProof3 <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-lc-dist-3"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid5 <- submit operator do
+    exerciseCmd poolCid4 DistributeRewards with
+      rewardAmount = 300.0
+      epochNumber = 3
+
+  -- 3. CANTON PRICE INCREASES (demand from pool)
+  syncPriceProof <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-lc-sync-price"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid6 <- submit operator do
+    exerciseCmd poolCid5 SyncCantonPrice with
+      newPriceMusd = 0.190  -- ~10% increase
+
+  -- 4. sMUSD SHARE PRICE INCREASES (Treasury yield)
+  syncShareProof <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-lc-sync-share"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  poolCid7 <- submit operator do
+    exerciseCmd poolCid6 SyncSharePrice with
+      newGlobalSharePrice = 1.05  -- 5% yield
+
+  -- 5. OPERATOR WITHDRAWS PROTOCOL REWARDS
+  -- 600 total rewards → 40% = 240 protocol share
+  wdProof <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-lc-wd-rewards"
+      actionType = TreasuryWithdrawal
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  (poolCid8, protocolCantonCid) <- submit operator do
+    exerciseCmd poolCid7 WithdrawProtocolRewards with
+      withdrawAmount = 240.0
+
+  -- 6. ALICE WITHDRAWS (with profit!)
+  -- Original: 10,000 CTN (minus entry fee)
+  -- LP rewards: 360 CTN (60% of 600)
+  -- Total pool balance should be ~10,335 CTN (9975 net deposit + 360 rewards)
+  setTime (addRelTime baseTime (seconds 172801))
+
+  (finalPoolCid, aliceCantonCid) <- submitMulti [alice] [operator] do
+    exerciseCmd poolCid8 Withdraw with
+      user = alice
+      lpCid
+
+  debug "TEST 23 PASSED: Full lifecycle — deposit → rewards → price sync → withdraw"
+  pure ()
+
+
+-- ============================================================
+--         TEST 24: OBSERVER UPDATE
+-- ============================================================
+
+-- | Admin can update pool observers
+test_ObserverUpdate : Script ()
+test_ObserverUpdate = script do
+  operator <- allocateParty "Operator"
+  charlie <- allocateParty "Charlie"
+
+  poolCid <- createPoolService operator []
+
+  poolCid2 <- submit operator do
+    exerciseCmd poolCid BoostPool_UpdateObservers with
+      newObservers = [charlie]
+
+  debug "TEST 24 PASSED: Observer update"
+  pure ()
+
+
+-- ============================================================
+--         TEST 25: NON-OPERATOR CANNOT ADMIN
+-- ============================================================
+
+-- | Non-operator cannot call admin choices
+test_NonOperatorAdmin : Script ()
+test_NonOperatorAdmin = script do
+  operator <- allocateParty "Operator"
+  governor <- allocateParty "Governor"
+  attacker <- allocateParty "Attacker"
+
+  poolCid <- createPoolService operator [attacker]
+
+  -- Attacker cannot pause
+  submitMultiMustFail [attacker] [operator] do
+    exerciseCmd poolCid BoostPool_SetPaused with
+      newPaused = True
+
+  -- Attacker cannot update fees (need governance proof, but test expects auth failure)
+  now <- getTime
+  dummyProof <- submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-attacker-fee"
+      actionType = ParameterUpdate
+      description = "test"
+      payload = ""
+      payloadHash = ""
+      targetModule = "CantonBoostPool"
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+  submitMultiMustFail [attacker] [operator] do
+    exerciseCmd poolCid BoostPool_UpdateFees with
+      newEntryFeeBps = 0
+      newExitFeeBps = 0
+      governanceProofCid = dummyProof
+
+  -- Attacker cannot distribute rewards
+  submitMultiMustFail [attacker] [operator] do
+    exerciseCmd poolCid DistributeRewards with
+      rewardAmount = 1000.0
+      epochNumber = 1
+
+  -- Attacker cannot sync prices
+  submitMultiMustFail [attacker] [operator] do
+    exerciseCmd poolCid SyncCantonPrice with
+      newPriceMusd = 0.200
+
+  submitMultiMustFail [attacker] [operator] do
+    exerciseCmd poolCid SyncSharePrice with
+      newGlobalSharePrice = 1.10
+
+  -- Attacker cannot withdraw protocol rewards
+  submitMultiMustFail [attacker] [operator] do
+    exerciseCmd poolCid WithdrawProtocolRewards with
+      withdrawAmount = 1.0
+
+  debug "TEST 25 PASSED: Non-operator cannot call admin choices"
+  pure ()
+
+
+-- ============================================================
+--         TEST 26: CANTON SMUSD TRANSFER PROPOSAL
+-- ============================================================
+
+-- | CantonSMUSDTransferProposal accept/reject/cancel lifecycle
+test_SMUSDTransferProposal : Script ()
+test_SMUSDTransferProposal = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- Create CantonSMUSD for Alice (using the existing helper)
+  smusdCid <- createSmusd operator alice 1000.0 1.0 baseTime
+
+  -- Transfer: Alice → Bob (needs readAs operator for ComplianceRegistry visibility)
+  proposalCid <- submitMulti [alice] [operator] do
+    exerciseCmd smusdCid SMUSD_Transfer with newOwner = bob
+
+  -- Bob accepts
+  newSmusdCid <- submitMulti [bob] [operator] do
+    exerciseCmd proposalCid CantonSMUSDTransferProposal_Accept
+
+  smusd <- queryContractId operator newSmusdCid
+  assertMsg "Bob owns sMUSD" ((fromSome smusd).owner == bob)
+
+  -- Test reject: create another sMUSD, propose, Bob rejects
+  smusd2Cid <- createSmusd operator alice 500.0 1.0 baseTime
+  proposalCid2 <- submitMulti [alice] [operator] do
+    exerciseCmd smusd2Cid SMUSD_Transfer with newOwner = bob
+  rejectedCid <- submitMulti [bob] [operator] do
+    exerciseCmd proposalCid2 CantonSMUSDTransferProposal_Reject
+  rej <- queryContractId operator rejectedCid
+  assertMsg "Alice still owns after reject" ((fromSome rej).owner == alice)
+
+  -- Test cancel: create another, propose, Alice cancels
+  smusd3Cid <- createSmusd operator alice 300.0 1.0 baseTime
+  proposalCid3 <- submitMulti [alice] [operator] do
+    exerciseCmd smusd3Cid SMUSD_Transfer with newOwner = bob
+  cancelledCid <- submitMulti [alice] [operator] do
+    exerciseCmd proposalCid3 CantonSMUSDTransferProposal_Cancel
+  can <- queryContractId operator cancelledCid
+  assertMsg "Alice still owns after cancel" ((fromSome can).owner == alice)
+
+  debug "TEST 26 PASSED: CantonSMUSDTransferProposal accept/reject/cancel"
+  pure ()

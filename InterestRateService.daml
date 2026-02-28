@@ -1,0 +1,224 @@
+-- | InterestRateService.daml - Dynamic Interest Rate Model for Canton
+--
+-- This module provides utilization-based interest rate calculations
+-- synced from Ethereum's InterestRateModel.sol. Canton vaults use this
+-- for consistent interest accrual across both chains.
+--
+-- Rate Model (Compound-style kinked curve):
+--   - Below kink: BorrowRate = baseRate + (utilization * multiplier)
+--   - Above kink: BorrowRate = baseRate + (kink * multiplier) + ((util - kink) * jumpMultiplier)
+--   - SupplyRate = BorrowRate * utilization * (1 - reserveFactor)
+
+module InterestRateService where
+
+import DA.Time
+import DA.Optional (fromOptional)
+
+-- ============================================================
+--                     RATE PARAMETERS
+-- ============================================================
+
+-- | Rate model parameters synced from Ethereum
+data RateParams = RateParams with
+    baseRateBps : Int           -- Base rate (e.g., 200 = 2%)
+    multiplierBps : Int         -- Slope below kink (e.g., 1000 = 10% at 100% util)
+    kinkBps : Int               -- Kink point (e.g., 8000 = 80%)
+    jumpMultiplierBps : Int     -- Slope above kink (e.g., 5000 = 50%)
+    reserveFactorBps : Int      -- Protocol reserves (e.g., 1000 = 10%)
+  deriving (Eq, Show)
+
+-- | Default rate parameters matching Ethereum defaults
+defaultRateParams : RateParams
+defaultRateParams = RateParams with
+    baseRateBps = 200           -- 2% base
+    multiplierBps = 1000        -- 10% at 100% util (pre-kink)
+    kinkBps = 8000              -- 80% kink
+    jumpMultiplierBps = 5000    -- 50% above kink
+    reserveFactorBps = 1000     -- 10% to reserves
+
+-- ============================================================
+--                     UTILIZATION DATA
+-- ============================================================
+
+-- | Market state synced from Ethereum
+data MarketState = MarketState with
+    totalBorrows : Decimal      -- Total borrowed (18 decimals)
+    totalSupply : Decimal       -- Total supplied (from Treasury.totalValue())
+    lastUpdateTime : Time       -- When this was last synced
+    ethBlockNumber : Int        -- Ethereum block for verification
+  deriving (Eq, Show)
+
+-- ============================================================
+--                     INTEREST RATE SERVICE
+-- ============================================================
+
+-- | InterestRateService - Canton-side interest rate calculator
+-- Synced from Ethereum to ensure consistent rates across chains.
+template InterestRateService
+  with
+    operator : Party
+    governance : Party          -- Can update rate params
+    params : RateParams
+    marketState : MarketState
+    observers : [Party]
+  where
+    signatory operator, governance
+    observer observers
+
+    ensure params.baseRateBps >= 0
+        && params.multiplierBps >= 0
+        && params.kinkBps >= 0 && params.kinkBps <= 10000
+        && params.jumpMultiplierBps >= 0
+        && params.reserveFactorBps >= 0 && params.reserveFactorBps <= 5000
+
+    -- | Calculate utilization rate (0-10000 BPS)
+    nonconsuming choice RateService_GetUtilization : Int
+      with
+        requester : Party
+      controller requester
+      do
+        now <- getTime
+        assertMsg "MARKET_DATA_STALE" (subTime now marketState.lastUpdateTime <= hours 6)
+        if marketState.totalSupply == 0.0
+          then return 0
+          else do
+            let util = (marketState.totalBorrows * 10000.0) / marketState.totalSupply
+            return (min 10000 (truncate util))
+
+    -- | Calculate annual borrow rate in BPS
+    nonconsuming choice RateService_GetBorrowRate : Int
+      with
+        requester : Party
+      controller requester
+      do
+        util <- exercise self RateService_GetUtilization with requester
+        if util <= params.kinkBps
+          then return (params.baseRateBps + (util * params.multiplierBps) / 10000)
+          else do
+            let normalRate = params.baseRateBps + (params.kinkBps * params.multiplierBps) / 10000
+            let excessUtil = util - params.kinkBps
+            return (normalRate + (excessUtil * params.jumpMultiplierBps) / 10000)
+
+    -- | Calculate annual supply rate in BPS
+    nonconsuming choice RateService_GetSupplyRate : Int
+      with
+        requester : Party
+      controller requester
+      do
+        borrowRate <- exercise self RateService_GetBorrowRate with requester
+        util <- exercise self RateService_GetUtilization with requester
+        let oneMinusReserve = 10000 - params.reserveFactorBps
+        -- SupplyRate = BorrowRate * Utilization * (1 - ReserveFactor)
+        let supplyRate =
+              (intToDecimal borrowRate
+                * intToDecimal util
+                * intToDecimal oneMinusReserve)
+              / 100000000.0
+        return (truncate supplyRate)
+
+    -- | Calculate interest for a given principal and duration
+    nonconsuming choice RateService_CalculateInterest : Decimal
+      with
+        requester : Party
+        principal : Decimal
+        durationSeconds : Int
+      controller requester
+      do
+        assertMsg "PRINCIPAL_MUST_BE_POSITIVE" (principal > 0.0)
+        assertMsg "DURATION_MUST_BE_POSITIVE" (durationSeconds > 0)
+        
+        borrowRateBps <- exercise self RateService_GetBorrowRate with requester
+        let secondsPerYear = 31536000.0  -- 365 * 24 * 60 * 60
+        let ratePerSecond = intToDecimal borrowRateBps / (10000.0 * secondsPerYear)
+        return (principal * ratePerSecond * intToDecimal durationSeconds)
+
+    -- | Split interest into supplier and reserve portions
+    nonconsuming choice RateService_SplitInterest : (Decimal, Decimal)
+      with
+        requester : Party
+        interestAmount : Decimal
+      controller requester
+      do
+        let reserveAmount = interestAmount * intToDecimal params.reserveFactorBps / 10000.0
+        let supplierAmount = interestAmount - reserveAmount
+        return (supplierAmount, reserveAmount)
+
+    -- | Sync market state from Ethereum (via bridge attestation)
+    -- D-M-03: Require governance co-signature and attestation for market state sync
+    choice RateService_SyncMarketState : ContractId InterestRateService
+      with
+        newTotalBorrows : Decimal
+        newTotalSupply : Decimal
+        ethBlockNumber : Int
+        attestationHash : Text    -- D-M-03: SHA-256 attestation from bridge validators
+      controller operator, governance
+      do
+        assertMsg "STALE_DATA" (ethBlockNumber > marketState.ethBlockNumber)
+        assertMsg "BORROWS_MUST_BE_NON_NEGATIVE" (newTotalBorrows >= 0.0)
+        assertMsg "SUPPLY_MUST_BE_NON_NEGATIVE" (newTotalSupply >= 0.0)
+        assertMsg "BORROWS_CANNOT_EXCEED_SUPPLY" (newTotalBorrows <= newTotalSupply)
+        -- D-M-03: Require non-empty attestation hash to prevent unverified syncs
+        assertMsg "ATTESTATION_REQUIRED" (attestationHash /= "")
+        now <- getTime
+        create this with
+          marketState = MarketState with
+            totalBorrows = newTotalBorrows
+            totalSupply = newTotalSupply
+            lastUpdateTime = now
+            ethBlockNumber = ethBlockNumber
+
+    -- | Update rate parameters (governance only)
+    choice RateService_UpdateParams : ContractId InterestRateService
+      with
+        newParams : RateParams
+      controller governance
+      do
+        -- Validate params
+        assertMsg "INVALID_KINK" (newParams.kinkBps >= 0 && newParams.kinkBps <= 10000)
+        assertMsg "RESERVE_TOO_HIGH" (newParams.reserveFactorBps <= 5000)
+        
+        -- Calculate max rate at 100% util
+        let maxRate = newParams.baseRateBps 
+                    + (newParams.kinkBps * newParams.multiplierBps) / 10000
+                    + ((10000 - newParams.kinkBps) * newParams.jumpMultiplierBps) / 10000
+        assertMsg "MAX_RATE_TOO_HIGH" (maxRate <= 10000)  -- Max 100% APR
+        
+        create this with params = newParams
+
+-- ============================================================
+--                     INTEREST RECEIPT (Audit Trail)
+-- ============================================================
+
+-- | InterestPayment - Immutable record of interest paid
+template InterestPayment
+  with
+    operator : Party
+    borrower : Party
+    principalAtPayment : Decimal
+    interestAmount : Decimal
+    supplierPortion : Decimal
+    reservePortion : Decimal
+    borrowRateBps : Int
+    utilizationBps : Int
+    paymentTime : Time
+    vaultContractId : Text      -- Reference to the vault
+  where
+    signatory operator, borrower
+
+    ensure interestAmount > 0.0
+        && supplierPortion + reservePortion == interestAmount
+        && borrowRateBps >= 0
+        && utilizationBps >= 0 && utilizationBps <= 10000
+
+-- ============================================================
+--                     HELPER FUNCTIONS
+-- ============================================================
+
+-- | Calculate simple interest
+-- Note: For Canton, we pass duration as seconds directly (Int)
+-- since RelTime conversion is handled at the call site
+calculateSimpleInterest : Decimal -> Int -> Int -> Decimal
+calculateSimpleInterest principal rateBps durationSeconds =
+    let secondsPerYear = 31536000.0
+        rateDecimal = intToDecimal rateBps / 10000.0
+    in principal * rateDecimal * (intToDecimal durationSeconds / secondsPerYear)

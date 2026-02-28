@@ -1,0 +1,279 @@
+-- | Upgrade.daml - Contract Upgrade and Data Migration Framework
+--
+-- This module provides a safe, auditable mechanism for migrating contract state
+-- when upgrading from one template version to another. It follows Canton best
+-- practices for contract upgrades:
+--
+--   1. Operator proposes an upgrade with a migration script hash
+--   2. Governance approves the upgrade (multi-sig threshold)
+--   3. Asset holders explicitly opt-in to migrate their holdings
+--   4. All migrations are logged for audit trail
+--
+-- Design decisions:
+--   - No automatic migration: Users must consent to upgrade their holdings
+--   - Batch limits prevent gas-like exhaustion on Canton
+--   - Rollback window allows reverting if issues discovered post-migration
+--   - All state transitions logged via UpgradeMigrationLog
+
+module Upgrade where
+
+import DA.Time
+import DA.Set qualified as Set
+import DA.List (dedup)
+import DA.Optional (isSome, fromSome)
+import DA.Text qualified as T
+
+-- ============================================================
+--                     TYPE DEFINITIONS
+-- ============================================================
+
+-- | Upgrade status lifecycle
+data UpgradeStatus
+  = Proposed      -- Initial proposal awaiting approvals
+  | Approved      -- Governance threshold met
+  | Active        -- Migration window open
+  | Completed     -- All migrations finalized
+  | Cancelled     -- Upgrade aborted
+  | RolledBack    -- Upgrade reverted after issues
+  deriving (Eq, Show)
+
+-- | Migration direction for rollback support
+data MigrationDirection
+  = Forward       -- V(n) -> V(n+1)
+  | Backward      -- V(n+1) -> V(n) rollback
+  deriving (Eq, Show)
+
+-- ============================================================
+--                     1. UPGRADE PROPOSAL
+-- ============================================================
+
+-- | UpgradeProposal - Governance proposal for contract upgrade.
+-- Requires threshold approvals from governance signers before activation.
+template UpgradeProposal
+  with
+    operator : Party              -- Protocol operator initiating upgrade
+    governance : [Party]          -- List of governance signers
+    approvalThreshold : Int       -- Number of approvals required (e.g., 2-of-3)
+    approvals : Set.Set Party     -- Collected approvals
+    sourceVersion : Text          -- Current version (e.g., "V2")
+    targetVersion : Text          -- New version (e.g., "V3")
+    migrationScriptHash : Text    -- SHA-256 of migration logic for verification
+    changelogUri : Text           -- Link to upgrade documentation
+    proposedAt : Time
+    activationDelay : RelTime     -- Time between approval and activation
+    migrationWindowDays : Int     -- How long users have to migrate
+    rollbackWindowDays : Int      -- How long rollback is available post-migration
+    status : UpgradeStatus
+  where
+    signatory operator
+    observer governance
+
+    ensure approvalThreshold > 0
+        && approvalThreshold <= length governance
+        && T.length sourceVersion > 0
+        && T.length targetVersion > 0
+        && T.length migrationScriptHash == 64  -- SHA-256 hex
+        && migrationWindowDays > 0
+        && rollbackWindowDays >= 0
+
+    -- | Governance member approves the upgrade
+    choice UpgradeProposal_Approve : ContractId UpgradeProposal
+      with
+        approver : Party
+      controller approver
+      do
+        assertMsg "NOT_GOVERNANCE_MEMBER" (approver `elem` governance)
+        assertMsg "ALREADY_APPROVED" (not (Set.member approver approvals))
+        assertMsg "INVALID_STATUS" (status == Proposed)
+        
+        let newApprovals = Set.insert approver approvals
+        let isApproved = Set.size newApprovals >= approvalThreshold
+        
+        create this with
+          approvals = newApprovals
+          status = if isApproved then Approved else Proposed
+
+    -- | Activate the upgrade after approval and delay
+    choice UpgradeProposal_Activate : ContractId UpgradeRegistry
+      with
+        activator : Party
+      controller operator
+      do
+        assertMsg "NOT_APPROVED" (status == Approved)
+        now <- getTime
+        let activationTime = addRelTime proposedAt activationDelay
+        assertMsg "ACTIVATION_DELAY_NOT_MET" (now >= activationTime)
+        
+        -- Create the active registry for migrations
+        create UpgradeRegistry with
+          operator
+          governance
+          sourceVersion
+          targetVersion
+          migrationScriptHash
+          activatedAt = now
+          migrationDeadline = addRelTime now (days migrationWindowDays)
+          rollbackDeadline = addRelTime now (days (migrationWindowDays + rollbackWindowDays))
+          totalMigrated = 0
+          totalRolledBack = 0
+          status = Active
+
+    -- | Cancel the upgrade proposal
+    choice UpgradeProposal_Cancel : ()
+      with
+        reason : Text
+      controller operator
+      do
+        assertMsg "CANNOT_CANCEL_ACTIVE" (status == Proposed || status == Approved)
+        assertMsg "REASON_REQUIRED" (T.length reason > 0)
+        return ()
+
+-- ============================================================
+--                     2. UPGRADE REGISTRY
+-- ============================================================
+
+-- | UpgradeRegistry - Active upgrade tracking and migration coordination.
+-- Created after proposal approval, tracks all migrations.
+template UpgradeRegistry
+  with
+    operator : Party
+    governance : [Party]
+    sourceVersion : Text
+    targetVersion : Text
+    migrationScriptHash : Text
+    activatedAt : Time
+    migrationDeadline : Time
+    rollbackDeadline : Time
+    totalMigrated : Int
+    totalRolledBack : Int
+    status : UpgradeStatus
+  where
+    signatory operator
+    observer governance
+
+    ensure totalMigrated >= 0 && totalRolledBack >= 0
+
+    -- | Record a successful migration (called by MigrationTicket)
+    choice UpgradeRegistry_RecordMigration : ContractId UpgradeRegistry
+      with
+        count : Int
+        direction : MigrationDirection
+      controller operator
+      do
+        now <- getTime
+        case direction of
+          Forward -> do
+            assertMsg "MIGRATION_WINDOW_CLOSED" (now <= migrationDeadline)
+            create this with totalMigrated = totalMigrated + count
+          Backward -> do
+            assertMsg "ROLLBACK_WINDOW_CLOSED" (now <= rollbackDeadline)
+            create this with totalRolledBack = totalRolledBack + count
+
+    -- | Complete the upgrade (closes migration window)
+    choice UpgradeRegistry_Complete : ContractId UpgradeRegistry
+      controller operator
+      do
+        now <- getTime
+        assertMsg "MIGRATION_WINDOW_NOT_ENDED" (now > migrationDeadline)
+        create this with status = Completed
+
+    -- | Emergency rollback (governance triggered)
+    choice UpgradeRegistry_EmergencyRollback : ContractId UpgradeRegistry
+      with
+        reason : Text
+        authorizer : Party
+      controller authorizer
+      do
+        assertMsg "NOT_GOVERNANCE" (authorizer `elem` governance)
+        assertMsg "REASON_REQUIRED" (T.length reason > 0)
+        now <- getTime
+        assertMsg "ROLLBACK_WINDOW_CLOSED" (now <= rollbackDeadline)
+        create this with status = RolledBack
+
+-- ============================================================
+--                     3. MIGRATION TICKET
+-- ============================================================
+
+-- | MigrationTicket - User's opt-in to migrate their holdings.
+-- Each user must explicitly request migration of their assets.
+template MigrationTicket
+  with
+    operator : Party
+    holder : Party                -- Asset owner requesting migration
+    registryCid : ContractId UpgradeRegistry -- Explicit registry reference captured at ticket creation
+    upgradeKey : (Party, Text, Text)  -- Reference to UpgradeRegistry
+    contractsToMigrate : [Text]   -- Contract IDs to migrate (serialized)
+    requestedAt : Time
+    batchSize : Int               -- Max contracts per migration tx
+    direction : MigrationDirection
+  where
+    signatory operator, holder
+
+    ensure length contractsToMigrate > 0
+        && batchSize > 0
+        && batchSize <= 100  -- Prevent DoS
+
+    -- | Execute the migration (operator processes after validation)
+    choice MigrationTicket_Execute : ContractId UpgradeMigrationLog
+      controller operator
+      do
+        now <- getTime
+        
+        -- Verify upgrade is still active
+        registry <- fetch registryCid
+        assertMsg "REGISTRY_OPERATOR_MISMATCH" (registry.operator == operator)
+        assertMsg "REGISTRY_VERSION_MISMATCH" (registry.sourceVersion == upgradeKey._2)
+        assertMsg "REGISTRY_VERSION_MISMATCH" (registry.targetVersion == upgradeKey._3)
+        assertMsg "UPGRADE_NOT_ACTIVE" (registry.status == Active)
+        
+        -- Record migration count
+        exercise registryCid UpgradeRegistry_RecordMigration with
+          count = length contractsToMigrate
+          direction
+        
+        -- Create audit log
+        create UpgradeMigrationLog with
+          operator
+          holder
+          sourceVersion = upgradeKey._2
+          targetVersion = upgradeKey._3
+          contractsMigrated = contractsToMigrate
+          migratedAt = now
+          direction
+          txHash = ""  -- Populated by ledger
+
+    -- | Cancel migration request
+    choice MigrationTicket_Cancel : ()
+      controller holder
+      do return ()
+
+-- ============================================================
+--                     4. MIGRATION AUDIT LOG
+-- ============================================================
+
+-- | UpgradeMigrationLog - Immutable record of each migration.
+-- Cannot be archived, provides permanent audit trail.
+template UpgradeMigrationLog
+  with
+    operator : Party
+    holder : Party
+    sourceVersion : Text
+    targetVersion : Text
+    contractsMigrated : [Text]
+    migratedAt : Time
+    direction : MigrationDirection
+    txHash : Text
+  where
+    signatory operator, holder
+
+    -- No choices - immutable audit record
+    -- This contract remains on the ledger permanently for compliance
+
+-- ============================================================
+--                     5. NOTES
+-- ============================================================
+
+-- Helper functions for creating migration tickets are implemented
+-- in NegativeTests.daml using Daml Script for testing purposes.
+-- In production, these would be triggered via the JSON API or
+-- custom middleware.

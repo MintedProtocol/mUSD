@@ -1,0 +1,84 @@
+-- | CantonCoinToken
+-- Standalone Canton coin token module — extracted from CantonBoostPool
+-- to break the cyclic dependency between CantonBoostPool and CantonLending.
+--
+-- Both modules (and their tests) import CantonCoin from here.
+
+module CantonCoinToken where
+
+import CantonDirectMint (Money)
+-- DAML-H-01: Import Compliance module for transfer validation
+import Compliance (ComplianceRegistry(..), ValidateTransfer(..))
+import UserPrivacySettings (lookupUserObservers, UserPrivacySettings)
+
+-- | Represents Canton coin held on Canton Network.
+-- In production, this wraps the native Canton validator token.
+template CantonCoin
+  with
+    issuer : Party
+    owner  : Party
+    amount : Money
+    privacyObservers : [Party]  -- Opt-in transparency (from UserPrivacySettings)
+  where
+    signatory issuer, owner
+    observer privacyObservers
+    ensure amount > 0.0
+
+    -- | Update observers from user's privacy settings
+    -- DAML-H-02 FIX: User provides their settings CID explicitly (LF 2.x compatible)
+    choice CantonCoin_UpdateObservers : ContractId CantonCoin
+      with
+        settingsCid : Optional (ContractId UserPrivacySettings)
+      controller owner
+      do
+        newObservers <- lookupUserObservers issuer owner settingsCid
+        create this with privacyObservers = newObservers
+
+    -- DAML-H-01: Compliance validated at transfer initiation (matches CantonMUSD_Transfer pattern)
+    choice CantonCoin_Transfer : ContractId CantonCoinTransferProposal
+      with
+        newOwner : Party
+        complianceRegistryCid : ContractId ComplianceRegistry
+      controller owner
+      do
+        -- Validate sender not frozen/blacklisted, receiver not blacklisted
+        exercise complianceRegistryCid ValidateTransfer with
+          sender = owner
+          receiver = newOwner
+        create CantonCoinTransferProposal with coin = this; newOwner
+
+    choice CantonCoin_Split : (ContractId CantonCoin, ContractId CantonCoin)
+      with splitAmount : Money
+      controller owner
+      do
+        assertMsg "SPLIT_POSITIVE" (splitAmount > 0.0)
+        assertMsg "SPLIT_LESS_THAN_TOTAL" (splitAmount < amount)
+        c1 <- create this with amount = splitAmount
+        c2 <- create this with amount = amount - splitAmount
+        return (c1, c2)
+
+    choice CantonCoin_Burn : ()
+      controller issuer, owner
+      do return ()
+
+-- | Transfer proposal for CantonCoin (dual-signatory safe)
+template CantonCoinTransferProposal
+  with
+    coin     : CantonCoin
+    newOwner : Party
+  where
+    signatory coin.issuer, coin.owner
+    observer newOwner
+
+    -- Compliance already validated at transfer initiation (CantonCoin_Transfer)
+    choice CantonCoinTransferProposal_Accept : ContractId CantonCoin
+      controller newOwner
+      do create coin with owner = newOwner
+
+    choice CantonCoinTransferProposal_Reject : ContractId CantonCoin
+      controller newOwner
+      do create coin
+
+    choice CantonCoinTransferProposal_Cancel : ContractId CantonCoin
+      controller coin.owner
+      do create coin

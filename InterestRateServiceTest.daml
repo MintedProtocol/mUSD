@@ -1,0 +1,345 @@
+-- | InterestRateServiceTest
+-- Tests for InterestRateService: utilization, borrow/supply rates, interest calc,
+-- split interest, sync market state, update params.
+
+module InterestRateServiceTest where
+
+import InterestRateService
+import DA.Time
+import DA.Date
+import Daml.Script
+
+-- ============================================================
+--                     HELPERS
+-- ============================================================
+
+createRateService : Party -> Party -> MarketState -> Script (ContractId InterestRateService)
+createRateService operator governance mState =
+  submitMulti [operator, governance] [] do
+    createCmd InterestRateService with
+      operator; governance
+      params = defaultRateParams
+      marketState = mState
+      observers = [operator]
+
+mkMarket : Decimal -> Decimal -> Time -> MarketState
+mkMarket borrows supply t = MarketState with
+  totalBorrows = borrows; totalSupply = supply
+  lastUpdateTime = t; ethBlockNumber = 100
+
+-- ============================================================
+--         TEST 1: ZERO UTILIZATION
+-- ============================================================
+
+test_ZeroUtilization : Script ()
+test_ZeroUtilization = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  svc <- createRateService operator governance (mkMarket 0.0 1000000.0 now)
+
+  util <- submit operator do exerciseCmd svc RateService_GetUtilization with requester = operator
+  assertMsg "zero util" (util == 0)
+  pure ()
+
+-- ============================================================
+--         TEST 2: ZERO SUPPLY UTILIZATION
+-- ============================================================
+
+test_ZeroSupplyUtilization : Script ()
+test_ZeroSupplyUtilization = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  svc <- createRateService operator governance (mkMarket 0.0 0.0 now)
+
+  util <- submit operator do exerciseCmd svc RateService_GetUtilization with requester = operator
+  assertMsg "zero supply = zero util" (util == 0)
+  pure ()
+
+-- ============================================================
+--         TEST 3: BELOW KINK UTILIZATION
+-- ============================================================
+
+test_BelowKinkBorrowRate : Script ()
+test_BelowKinkBorrowRate = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  -- 50% utilization (below 80% kink)
+  svc <- createRateService operator governance (mkMarket 500000.0 1000000.0 now)
+
+  util <- submit operator do exerciseCmd svc RateService_GetUtilization with requester = operator
+  assertMsg "50% util" (util == 5000)
+
+  rate <- submit operator do exerciseCmd svc RateService_GetBorrowRate with requester = operator
+  -- baseRate(200) + (5000 * 1000) / 10000 = 200 + 500 = 700 bps (7%)
+  assertMsg "borrow rate at 50%" (rate == 700)
+  pure ()
+
+-- ============================================================
+--         TEST 4: ABOVE KINK UTILIZATION
+-- ============================================================
+
+test_AboveKinkBorrowRate : Script ()
+test_AboveKinkBorrowRate = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  -- 90% utilization (above 80% kink)
+  svc <- createRateService operator governance (mkMarket 900000.0 1000000.0 now)
+
+  util <- submit operator do exerciseCmd svc RateService_GetUtilization with requester = operator
+  assertMsg "90% util" (util == 9000)
+
+  rate <- submit operator do exerciseCmd svc RateService_GetBorrowRate with requester = operator
+  -- normalRate = 200 + (8000 * 1000) / 10000 = 200 + 800 = 1000
+  -- excessUtil = 9000 - 8000 = 1000
+  -- jumpPart = (1000 * 5000) / 10000 = 500
+  -- total = 1000 + 500 = 1500 bps (15%)
+  assertMsg "borrow rate at 90%" (rate == 1500)
+  pure ()
+
+-- ============================================================
+--         TEST 5: SUPPLY RATE
+-- ============================================================
+
+test_SupplyRate : Script ()
+test_SupplyRate = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  svc <- createRateService operator governance (mkMarket 500000.0 1000000.0 now)
+
+  supplyRate <- submit operator do exerciseCmd svc RateService_GetSupplyRate with requester = operator
+  -- BorrowRate = 700, Util = 5000, oneMinusReserve = 9000
+  -- (700 * 5000 * 9000) / (10000 * 10000) = 315 bps
+  assertMsg "supply rate" (supplyRate == 315)
+  pure ()
+
+-- ============================================================
+--         TEST 6: CALCULATE INTEREST
+-- ============================================================
+
+test_CalculateInterest : Script ()
+test_CalculateInterest = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  svc <- createRateService operator governance (mkMarket 500000.0 1000000.0 now)
+
+  interest <- submit operator do
+    exerciseCmd svc RateService_CalculateInterest with
+      requester = operator; principal = 100000.0; durationSeconds = 31536000
+
+  -- BorrowRate = 700 bps = 7%
+  -- Interest = 100000 * 0.07 = 7000 (approximately)
+  -- Note: Decimal (Numeric 10) precision causes minor truncation in ratePerSecond
+  assertMsg "interest positive" (interest > 0.0)
+  assertMsg "interest ~7000" (interest > 6900.0 && interest < 7100.0)
+  pure ()
+
+-- ============================================================
+--         TEST 7: SPLIT INTEREST
+-- ============================================================
+
+test_SplitInterest : Script ()
+test_SplitInterest = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  svc <- createRateService operator governance (mkMarket 500000.0 1000000.0 now)
+
+  (supplierPortion, reservePortion) <- submit operator do
+    exerciseCmd svc RateService_SplitInterest with requester = operator; interestAmount = 1000.0
+
+  -- reserveFactor = 1000 bps = 10%
+  assertMsg "reserve = 10%" (reservePortion == 100.0)
+  assertMsg "supplier = 90%" (supplierPortion == 900.0)
+  assertMsg "sum = total" (supplierPortion + reservePortion == 1000.0)
+  pure ()
+
+-- ============================================================
+--         TEST 8: SYNC MARKET STATE
+-- ============================================================
+
+test_SyncMarketState : Script ()
+test_SyncMarketState = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  svc <- createRateService operator governance (mkMarket 500000.0 1000000.0 now)
+
+  newSvc <- submitMulti [operator, governance] [] do
+    exerciseCmd svc RateService_SyncMarketState with
+      newTotalBorrows = 750000.0
+      newTotalSupply = 1200000.0
+      ethBlockNumber = 200
+      attestationHash = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+
+  -- Verify updated utilization
+  util <- submit operator do exerciseCmd newSvc RateService_GetUtilization with requester = operator
+  -- 750000 / 1200000 = 62.5% = 6250 bps
+  assertMsg "updated util" (util == 6250)
+  pure ()
+
+-- ============================================================
+--         TEST 9: STALE DATA REJECTED
+-- ============================================================
+
+test_StaleDataRejected : Script ()
+test_StaleDataRejected = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  svc <- createRateService operator governance (mkMarket 500000.0 1000000.0 now)
+
+  -- Same block number should fail
+  submitMultiMustFail [operator, governance] [] do
+    exerciseCmd svc RateService_SyncMarketState with
+      newTotalBorrows = 750000.0
+      newTotalSupply = 1200000.0
+      ethBlockNumber = 100  -- Same as existing
+      attestationHash = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+  pure ()
+
+-- ============================================================
+--         TEST 10: EMPTY ATTESTATION REJECTED
+-- ============================================================
+
+test_EmptyAttestationRejected : Script ()
+test_EmptyAttestationRejected = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  svc <- createRateService operator governance (mkMarket 500000.0 1000000.0 now)
+
+  submitMultiMustFail [operator, governance] [] do
+    exerciseCmd svc RateService_SyncMarketState with
+      newTotalBorrows = 750000.0; newTotalSupply = 1200000.0
+      ethBlockNumber = 200; attestationHash = ""
+  pure ()
+
+-- ============================================================
+--         TEST 11: UPDATE PARAMS
+-- ============================================================
+
+test_UpdateParams : Script ()
+test_UpdateParams = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  svc <- createRateService operator governance (mkMarket 500000.0 1000000.0 now)
+
+  newSvc <- submit governance do
+    exerciseCmd svc RateService_UpdateParams with
+      newParams = RateParams with
+        baseRateBps = 300; multiplierBps = 1200
+        kinkBps = 7500; jumpMultiplierBps = 4000
+        reserveFactorBps = 1500
+
+  -- Verify new rate
+  rate <- submit operator do exerciseCmd newSvc RateService_GetBorrowRate with requester = operator
+  -- baseRate(300) + (5000 * 1200) / 10000 = 300 + 600 = 900
+  assertMsg "updated rate" (rate == 900)
+  pure ()
+
+-- ============================================================
+--         TEST 12: MAX RATE CAP ENFORCEMENT
+-- ============================================================
+
+test_MaxRateCapEnforced : Script ()
+test_MaxRateCapEnforced = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  svc <- createRateService operator governance (mkMarket 500000.0 1000000.0 now)
+
+  -- Params that would produce >100% APR at full utilization
+  submitMustFail governance do
+    exerciseCmd svc RateService_UpdateParams with
+      newParams = RateParams with
+        baseRateBps = 5000; multiplierBps = 5000
+        kinkBps = 5000; jumpMultiplierBps = 10000
+        reserveFactorBps = 1000
+  pure ()
+
+-- ============================================================
+--         TEST 13: INTEREST PAYMENT RECORD
+-- ============================================================
+
+test_InterestPaymentRecord : Script ()
+test_InterestPaymentRecord = script do
+  operator <- allocateParty "Operator"
+  borrower <- allocateParty "Borrower"
+  now <- getTime
+
+  paymentCid <- submitMulti [operator, borrower] [] do
+    createCmd InterestPayment with
+      operator; borrower
+      principalAtPayment = 100000.0
+      interestAmount = 500.0
+      supplierPortion = 450.0
+      reservePortion = 50.0
+      borrowRateBps = 700
+      utilizationBps = 5000
+      paymentTime = now
+      vaultContractId = "vault-123"
+
+  payment <- queryContractId operator paymentCid
+  case payment of
+    Some p -> assertMsg "portions sum" (p.supplierPortion + p.reservePortion == p.interestAmount)
+    None -> abort "payment not found"
+  pure ()
+
+-- ============================================================
+--         TEST 14: NEGATIVE — ZERO PRINCIPAL
+-- ============================================================
+
+test_ZeroPrincipalFails : Script ()
+test_ZeroPrincipalFails = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  svc <- createRateService operator governance (mkMarket 500000.0 1000000.0 now)
+
+  submitMustFail operator do
+    exerciseCmd svc RateService_CalculateInterest with
+      requester = operator; principal = 0.0; durationSeconds = 31536000
+  pure ()
+
+-- ============================================================
+--         TEST 15: NEGATIVE — ZERO DURATION
+-- ============================================================
+
+test_ZeroDurationFails : Script ()
+test_ZeroDurationFails = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  svc <- createRateService operator governance (mkMarket 500000.0 1000000.0 now)
+
+  submitMustFail operator do
+    exerciseCmd svc RateService_CalculateInterest with
+      requester = operator; principal = 100000.0; durationSeconds = 0
+  pure ()
+
+-- ============================================================
+--         TEST 16: AT KINK BOUNDARY
+-- ============================================================
+
+test_AtKinkBoundary : Script ()
+test_AtKinkBoundary = script do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  now <- getTime
+  -- Exactly at 80% kink
+  svc <- createRateService operator governance (mkMarket 800000.0 1000000.0 now)
+
+  util <- submit operator do exerciseCmd svc RateService_GetUtilization with requester = operator
+  assertMsg "80% util" (util == 8000)
+
+  rate <- submit operator do exerciseCmd svc RateService_GetBorrowRate with requester = operator
+  -- baseRate(200) + (8000 * 1000) / 10000 = 200 + 800 = 1000 bps (10%)
+  assertMsg "rate at kink" (rate == 1000)
+  pure ()

@@ -1,0 +1,157 @@
+-- | Compliance module for enterprise stablecoin regulation
+--
+-- Provides a ComplianceRegistry that enables:
+--   1. Blacklisting parties (OFAC, sanctions, fraud)
+--   2. Freezing individual asset positions
+--   3. Pre-transaction validation hooks for mint/transfer/redeem
+--
+-- Design decisions:
+--   - Registry is signatory-controlled by the regulator party
+--   - Blacklist checks use Set for O(log n) lookup instead of list O(n) scan
+--   - Freeze is per-party (not per-contract) to prevent evasion via splitting
+--   - ValidateTransaction is nonconsuming so it can be called from other templates
+--     without archiving the registry
+--   - RemoveFromBlacklist requires explicit action (no expiry) for audit trail
+
+module Compliance where
+
+import DA.Set qualified as Set
+
+-- | The ComplianceRegistry manages which parties are allowed to hold/transfer mUSD.
+-- A regulator creates one instance and uses it as a shared reference for all
+-- compliance checks across the protocol.
+template ComplianceRegistry
+  with
+    regulator : Party
+    operator : Party               -- Protocol operator (observer for integration)
+    blacklisted : Set.Set Party    -- O(log n) lookup via Set, not list
+    frozen : Set.Set Party         -- Parties whose assets are frozen (can't transfer out)
+    lastUpdated : Time
+  where
+    signatory regulator
+    observer operator
+
+    ensure regulator /= operator
+
+    -- | Add a party to the blacklist. Blacklisted parties cannot send or receive mUSD.
+    choice BlacklistUser : ContractId ComplianceRegistry
+      with
+        userToBlock : Party
+        reason : Text              -- Audit trail: why this party is blocked
+      controller regulator
+      do
+        assertMsg "ALREADY_BLACKLISTED" (not (Set.member userToBlock blacklisted))
+        assertMsg "REASON_REQUIRED" (reason /= "")
+        now <- getTime
+        -- Log the action (the choice exercise itself is the audit record on the ledger)
+        create this with
+          blacklisted = Set.insert userToBlock blacklisted
+          lastUpdated = now
+
+    -- | Remove a party from the blacklist (e.g., after investigation clears them)
+    choice RemoveFromBlacklist : ContractId ComplianceRegistry
+      with
+        userToUnblock : Party
+        reason : Text
+      controller regulator
+      do
+        assertMsg "NOT_BLACKLISTED" (Set.member userToUnblock blacklisted)
+        assertMsg "REASON_REQUIRED" (reason /= "")
+        now <- getTime
+        create this with
+          blacklisted = Set.delete userToUnblock blacklisted
+          lastUpdated = now
+
+    -- | Freeze a party's assets. Frozen parties cannot transfer or redeem,
+    -- but CAN still receive (to allow recovery/consolidation).
+    choice FreezeUser : ContractId ComplianceRegistry
+      with
+        userToFreeze : Party
+        reason : Text
+      controller regulator
+      do
+        assertMsg "ALREADY_FROZEN" (not (Set.member userToFreeze frozen))
+        assertMsg "REASON_REQUIRED" (reason /= "")
+        now <- getTime
+        create this with
+          frozen = Set.insert userToFreeze frozen
+          lastUpdated = now
+
+    -- | Unfreeze a party's assets
+    choice UnfreezeUser : ContractId ComplianceRegistry
+      with
+        userToUnfreeze : Party
+        reason : Text
+      controller regulator
+      do
+        assertMsg "NOT_FROZEN" (Set.member userToUnfreeze frozen)
+        assertMsg "REASON_REQUIRED" (reason /= "")
+        now <- getTime
+        create this with
+          frozen = Set.delete userToUnfreeze frozen
+          lastUpdated = now
+
+    -- | Validate a mint transaction. Only the sender (minter) needs to be checked.
+    -- Nonconsuming — can be called from DirectMint choices without archiving.
+    -- CRITICAL: Changed controller to operator only. The operator acts on behalf of the
+    -- regulator when exercising from CantonDirectMint. The regulator's policy is enforced
+    -- by the blacklist/frozen data maintained on this contract (which only regulator can modify).
+    nonconsuming choice ValidateMint : ()
+      with
+        minter : Party
+      controller operator
+      do
+        assertMsg "MINTER_BLACKLISTED" (not (Set.member minter blacklisted))
+        -- Frozen parties CAN receive (mint creates new assets for them),
+        -- but blacklisted parties cannot participate at all.
+
+    -- | Validate a transfer between two parties.
+    -- Checks both sender and receiver against blacklist.
+    -- Also checks sender against freeze list (frozen can receive but not send).
+    -- CRITICAL: Changed controller to operator only for cross-template compatibility.
+    nonconsuming choice ValidateTransfer : ()
+      with
+        sender : Party
+        receiver : Party
+      controller operator
+      do
+        assertMsg "SENDER_BLACKLISTED" (not (Set.member sender blacklisted))
+        assertMsg "RECEIVER_BLACKLISTED" (not (Set.member receiver blacklisted))
+        assertMsg "SENDER_FROZEN" (not (Set.member sender frozen))
+
+    -- | Validate a redemption (burn). Checks the redeemer is not blacklisted or frozen.
+    -- CRITICAL: Changed controller to operator only for cross-template compatibility.
+    nonconsuming choice ValidateRedemption : ()
+      with
+        redeemer : Party
+      controller operator
+      do
+        assertMsg "REDEEMER_BLACKLISTED" (not (Set.member redeemer blacklisted))
+        assertMsg "REDEEMER_FROZEN" (not (Set.member redeemer frozen))
+
+    -- | Check if a party is in good standing (not blacklisted, not frozen)
+    nonconsuming choice IsCompliant : Bool
+      with
+        party : Party
+        caller : Party
+      controller caller
+      do
+        return (not (Set.member party blacklisted) && not (Set.member party frozen))
+
+    -- | Bulk blacklist for sanctions list imports
+    choice BulkBlacklist : ContractId ComplianceRegistry
+      with
+        usersToBlock : [Party]
+        reason : Text
+      controller regulator
+      do
+        assertMsg "REASON_REQUIRED" (reason /= "")
+        assertMsg "EMPTY_LIST" (not (null usersToBlock))
+        -- D-L-04: Increase bulk cap from 100 to 1000 for emergency mass-freeze scenarios
+        -- (e.g., exploit response requiring rapid blacklisting of many attacker addresses)
+        assertMsg "BULK_LIMIT_EXCEEDED" (length usersToBlock <= 1000)
+        now <- getTime
+        let newBlacklisted = foldl (\acc p -> Set.insert p acc) blacklisted usersToBlock
+        create this with
+          blacklisted = newBlacklisted
+          lastUpdated = now

@@ -1,0 +1,90 @@
+-- | AuditReceipts — Immutable on-ledger audit trail for regulatory compliance.
+--
+-- DAML-C-02 FIX: These templates are created by mint, burn, and transfer choices
+-- in CantonDirectMint and Minted.Protocol.V3. Each receipt is an immutable,
+-- non-archivable contract that provides a permanent audit trail for regulators.
+--
+-- Receipt lifecycle:
+--   1. Choice fires (e.g., DirectMint_Mint) → creates MintAuditReceipt
+--   2. Receipt is visible to operator (signatory) + regulator + user (observers)
+--   3. Receipts are never archived — permanent ledger history
+--   4. Regulators can query all receipts via the Ledger API
+
+module AuditReceipts where
+
+import DA.Time
+
+-- | 18-decimal precision for 1:1 mapping with Ethereum Wei
+type Money = Numeric 18
+
+-- | AuditAction — categorizes the type of protocol action
+data AuditAction
+  = Mint
+  | Burn
+  | Transfer
+  | Redeem
+  | BridgeOut
+  | BridgeIn
+  | Liquidation
+  | Stake
+  | Unstake
+  deriving (Eq, Show)
+
+-- | MintAuditReceipt — Created whenever mUSD is minted on Canton.
+-- Captures the minter, amount, fees, supply state, and compliance validation result.
+template MintAuditReceipt
+  with
+    operator    : Party       -- Protocol operator (signatory)
+    regulator   : Party       -- Compliance authority (observer)
+    minter      : Party       -- User who initiated the mint
+    amount      : Money       -- Gross deposit amount
+    feeAmount   : Money       -- Fee deducted
+    netMinted   : Money       -- Net mUSD minted (amount - fee)
+    supplyAfter : Money       -- Total supply after this mint
+    bridgeNonce : Int         -- BridgeOutRequest nonce for cross-chain correlation
+    timestamp   : Time        -- Ledger-effective time of the mint
+    txHash      : Text        -- Off-chain correlation ID (Ethereum tx hash if bridge-originated)
+    action      : AuditAction -- Always Mint
+  where
+    signatory operator
+    observer regulator, minter
+
+    -- Receipts are immutable — no choices that archive.
+    -- Archive is only possible by the signatory (operator) for error correction,
+    -- which itself creates a visible ledger event.
+
+-- | BurnAuditReceipt — Created whenever mUSD is burned/redeemed on Canton.
+-- Captures the burner, amount, and the resulting bridge-in request if applicable.
+template BurnAuditReceipt
+  with
+    operator     : Party       -- Protocol operator (signatory)
+    regulator    : Party       -- Compliance authority (observer)
+    burner       : Party       -- User who initiated the burn/redeem
+    amount       : Money       -- mUSD amount burned
+    feeAmount    : Money       -- Fee deducted
+    netRedeemed  : Money       -- Net amount sent to bridge-in (amount - fee)
+    supplyAfter  : Money       -- Total supply after this burn
+    bridgeNonce  : Int         -- BridgeInRequest nonce for cross-chain correlation
+    timestamp    : Time        -- Ledger-effective time of the burn
+    txHash       : Text        -- Off-chain correlation ID
+    action       : AuditAction -- Always Burn or Redeem
+  where
+    signatory operator
+    observer regulator, burner
+
+-- | TransferAuditReceipt — Created whenever mUSD or other Canton tokens are transferred.
+-- Captures sender, recipient, amount, and compliance validation.
+template TransferAuditReceipt
+  with
+    operator   : Party       -- Protocol operator (signatory)
+    regulator  : Party       -- Compliance authority (observer)
+    sender     : Party       -- Transfer initiator
+    recipient  : Party       -- Transfer recipient
+    tokenType  : Text        -- "CantonMUSD", "CantonUSDC", "USDCx", "CantonSMUSD", etc.
+    amount     : Money       -- Amount transferred
+    timestamp  : Time        -- Ledger-effective time of the transfer
+    txHash     : Text        -- Off-chain correlation ID
+    action     : AuditAction -- Always Transfer
+  where
+    signatory operator
+    observer regulator, sender, recipient

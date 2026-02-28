@@ -1,0 +1,586 @@
+-- | CantonSMUSD
+-- Canton-native staked mUSD (smUSD) with VAULT-HELD backing and cooldown enforcement.
+-- For the V3 bridge-integrated yield vault, see Minted.Protocol.V3 (CantonSMUSD template).
+-- This standalone module is the authoritative Canton-native staking implementation.
+--
+-- Canton-side staked mUSD (smUSD) with VAULT yield model
+--
+-- Architecture:
+--   smUSD on Canton uses a VAULT model (mirrors Ethereum ERC-4626 pattern).
+--   mUSD is deposited into the pool vault on stake — the vault HOLDS the mUSD (builds TVL).
+--   mUSD is NOT burned. It lives in the vault as an operator-owned CantonMUSD contract.
+--   On unstake, mUSD is withdrawn from the vault back to the user.
+--   Yield mUSD from Ethereum is merged into the vault → pool grows → share price rises.
+--
+--   VAULT share price model:
+--     localSharePrice = pooledMusd / totalShares
+--
+--   When Ethereum Treasury generates yield:
+--     1. YieldDistributor on ETH bridges Canton's yield portion via BLEBridgeV9
+--     2. Relay mints CantonMUSD to operator → operator calls ReceiveYield
+--     3. Yield mUSD merged into vault → pooledMusd increases → localSharePrice rises
+--     4. Users unstake at vault-derived price → fully backed by real mUSD in vault
+
+module CantonSMUSD where
+
+import DA.Time
+import CantonDirectMint (CantonMUSD(..), CantonMUSD_Merge(..), Money)
+import UserPrivacySettings (lookupUserObservers, UserPrivacySettings)
+import Compliance (ComplianceRegistry(..), ValidateMint(..), ValidateRedemption(..), ValidateTransfer(..))
+
+-- ============================================================
+--                     SECTION 1: STAKED mUSD POSITION
+-- ============================================================
+
+-- | Individual smUSD position.
+-- Represents a user's share in the yield vault.
+-- Amount is in "shares" — redeemable for mUSD at current share price.
+-- FIX D-M01: Added stakedAt timestamp for cooldown enforcement
+template CantonSMUSD
+  with
+    issuer : Party
+    owner : Party
+    shares : Money          -- Number of shares (not mUSD amount)
+    entrySharePrice : Money -- Share price when staked (for tracking)
+    stakedAt : Time         -- FIX D-M01: Timestamp when staked (for cooldown)
+    complianceRegistryCid : ContractId ComplianceRegistry  -- HIGH-01: mandatory compliance
+    privacyObservers : [Party]  -- Opt-in transparency (from UserPrivacySettings)
+  where
+    signatory issuer, owner
+    observer privacyObservers
+
+    ensure shares > 0.0
+
+    -- | Update observers from user's privacy settings
+    -- DAML-H-02 FIX: User provides their settings CID explicitly (LF 2.x compatible)
+    choice SMUSD_UpdateObservers : ContractId CantonSMUSD
+      with
+        settingsCid : Optional (ContractId UserPrivacySettings)
+      controller owner
+      do
+        newObservers <- lookupUserObservers issuer owner settingsCid
+        create this with privacyObservers = newObservers
+
+    -- FIX DL-C2: Use proposal pattern for safe dual-signatory transfers
+    -- HIGH-01: Enforce compliance validation on transfers
+    choice SMUSD_Transfer : ContractId CantonSMUSDTransferProposal
+      with
+        newOwner : Party
+      controller owner
+      do
+        -- HIGH-01: Validate both sender and receiver against blacklist/freeze
+        exercise complianceRegistryCid ValidateTransfer
+          with sender = owner; receiver = newOwner
+        create CantonSMUSDTransferProposal with
+          smusd = this
+          newOwner
+
+    choice SMUSD_Split : (ContractId CantonSMUSD, ContractId CantonSMUSD)
+      with
+        splitShares : Money
+      controller owner
+      do
+        assertMsg "SPLIT_SHARES_POSITIVE" (splitShares > 0.0)
+        assertMsg "SPLIT_SHARES_LESS_THAN_TOTAL" (splitShares < shares)
+        c1 <- create this with shares = splitShares
+        c2 <- create this with shares = shares - splitShares
+        return (c1, c2)
+
+    choice SMUSD_Merge : ContractId CantonSMUSD
+      with
+        otherCid : ContractId CantonSMUSD
+      controller owner
+      do
+        other <- fetch otherCid
+        assertMsg "ISSUER_MISMATCH" (other.issuer == issuer)
+        assertMsg "OWNER_MISMATCH" (other.owner == owner)
+        archive otherCid
+        create this with shares = shares + other.shares
+
+-- | FIX DL-C2: Transfer proposal for CantonSMUSD (dual-signatory safe)
+-- Prevents forced signatory obligations on unwitting recipients
+template CantonSMUSDTransferProposal
+  with
+    smusd : CantonSMUSD
+    newOwner : Party
+  where
+    signatory smusd.issuer, smusd.owner
+    observer newOwner
+
+    choice CantonSMUSDTransferProposal_Accept : ContractId CantonSMUSD
+      controller newOwner
+      do create smusd with owner = newOwner
+
+    choice CantonSMUSDTransferProposal_Reject : ContractId CantonSMUSD
+      controller newOwner
+      do create smusd
+
+    choice CantonSMUSDTransferProposal_Cancel : ContractId CantonSMUSD
+      controller smusd.owner
+      do create smusd
+
+-- ============================================================
+--                     SECTION 2: STAKING SERVICE
+-- ============================================================
+
+-- | Canton smUSD staking service with UNIFIED cross-chain yield.
+-- Uses global share price synced from Ethereum for equal yield distribution.
+template CantonStakingService
+  with
+    operator : Party
+    governance : Party          -- FIX HIGH-07: Governance co-signer for critical operations
+    totalShares : Money         -- Total smUSD shares on Canton
+    pooledMusd : Money          -- Cached vault balance for share price calc (mirrors poolMusdCid.amount)
+    poolMusdCid : Optional (ContractId CantonMUSD)  -- Actual mUSD contract held in pool vault (TVL)
+    -- Informational: Global share price from Ethereum for cross-chain validation
+    globalSharePrice : Money    -- Synced from Ethereum (informational — not used for stake/unstake)
+    globalTotalAssets : Money   -- Total assets backing all shares (both chains, informational)
+    globalTotalShares : Money   -- Total shares across both chains (informational)
+    lastSyncEpoch : Int         -- Last synced epoch from Ethereum
+    cooldownSeconds : Int       -- Minimum stake duration before unstake
+    minDeposit : Money          -- Minimum mUSD deposit
+    paused : Bool
+    -- DAML-H-04: Mandatory compliance — all stakers must pass blacklist/freeze checks
+    complianceRegistryCid : ContractId ComplianceRegistry
+    -- Master Participation Agreement (passed through to CantonMUSD returned from pool)
+    mpaHash : Text
+    mpaUri : Text
+    observers : [Party]         -- Users who can exercise Stake/Unstake
+  where
+    signatory operator
+    observer observers
+
+    ensure totalShares >= 0.0 && pooledMusd >= 0.0
+
+    -- | Current share price: derived from pool backing (pooledMusd / totalShares)
+    nonconsuming choice GetSharePrice : Money
+      controller operator
+      do
+        let price = if totalShares > 0.0 then pooledMusd / totalShares else 1.0
+        return price
+
+    -- | Stake: mUSD → smUSD shares at pool-derived share price
+    -- User deposits mUSD into pool vault, receives proportional shares.
+    -- mUSD is held by the pool (operator-owned CantonMUSD) — builds TVL.
+    -- Mirrors Ethereum SMUSD ERC-4626 deposit() pattern where vault HOLDS tokens.
+    choice Stake : (ContractId CantonStakingService, ContractId CantonSMUSD)
+      with
+        user : Party
+        musdCid : ContractId CantonMUSD
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+
+        -- DAML-H-04: Mandatory compliance check — staker must not be blacklisted
+        exercise complianceRegistryCid ValidateMint with minter = user
+
+        musd <- fetch musdCid
+        assertMsg "ISSUER_MISMATCH" (musd.issuer == operator)
+        assertMsg "OWNER_MISMATCH" (musd.owner == user)
+        assertMsg "BELOW_MIN_DEPOSIT" (musd.amount >= minDeposit)
+
+        -- Calculate shares using pool-derived share price (ERC-4626 pattern)
+        let localSharePrice = if totalShares > 0.0 then pooledMusd / totalShares else 1.0
+        let newShares = musd.amount / localSharePrice
+
+        -- Deposit mUSD into pool vault (builds TVL — mUSD is NOT burned):
+        --   1. Archive user's contract (DAML ownership-transfer mechanic)
+        --   2. Create pool-held mUSD (operator-owned — vault holds the tokens)
+        --   3. Merge with existing vault balance
+        archive musdCid
+        poolDeposit <- create CantonMUSD with
+          issuer = operator
+          owner = operator
+          amount = musd.amount
+          agreementHash = mpaHash
+          agreementUri = mpaUri
+          privacyObservers = []
+        newPoolCid <- case poolMusdCid of
+          None -> return poolDeposit
+          Some existingCid -> exercise existingCid CantonMUSD_Merge with otherCid = poolDeposit
+
+        -- Issue smUSD shares
+        -- FIX D-M01: Record staked timestamp for cooldown enforcement
+        now <- getTime
+        userObs <- lookupUserObservers operator user None
+        smusdCid <- create CantonSMUSD with
+          issuer = operator
+          owner = user
+          shares = newShares
+          entrySharePrice = localSharePrice
+          stakedAt = now
+          complianceRegistryCid = complianceRegistryCid
+          privacyObservers = userObs
+
+        -- Update pool state: mUSD deposited in vault, shares issued
+        newService <- create this with
+          totalShares = totalShares + newShares
+          pooledMusd = pooledMusd + musd.amount
+          poolMusdCid = Some newPoolCid
+
+        return (newService, smusdCid)
+
+    -- | StakeFromInventory: CIP-56-native stake path.
+    -- Uses operator's own CantonMUSD inventory to stake on behalf of the user,
+    -- without requiring an intermediate user-owned CantonMUSD.
+    -- The CIP-56 token archive happens at the API layer (separate package).
+    --
+    -- Flow:
+    --   1. API archives user's CIP-56 tokens (CIP-56 package)
+    --   2. API creates CIP-56 escrow under operator (CIP-56 package)
+    --   3. This choice consumes operator inventory and deposits into pool
+    --   All submitted as a single atomic batch command.
+    --
+    -- Economic invariants match Stake:
+    --   - Same share price calculation
+    --   - Same pool deposit mechanics (vault-held mUSD)
+    --   - Same compliance validation
+    --   - Same minimum deposit enforcement
+    choice StakeFromInventory : (ContractId CantonStakingService, ContractId CantonSMUSD)
+      with
+        user              : Party
+        inventoryMusdCids : [ContractId CantonMUSD]  -- Operator-owned inventory tokens
+        stakeAmount       : Money                     -- Exact amount to stake
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        assertMsg "NO_INVENTORY_SOURCES" (not (null inventoryMusdCids))
+        assertMsg "BELOW_MIN_DEPOSIT" (stakeAmount >= minDeposit)
+
+        -- DAML-H-04: Mandatory compliance check — staker must not be blacklisted
+        exercise complianceRegistryCid ValidateMint with minter = user
+
+        -- Validate all inventory mUSD are operator-owned and sum sufficient
+        let validateInv cid = do
+              m <- fetch cid
+              assertMsg "INV_NOT_OPERATOR_OWNED" (m.owner == operator && m.issuer == operator)
+              return m.amount
+        amounts <- mapA validateInv inventoryMusdCids
+        let totalInventory = foldl (+) 0.0 amounts
+        assertMsg "INSUFFICIENT_INVENTORY" (totalInventory >= stakeAmount)
+
+        -- Archive all inventory sources
+        _ <- mapA archive inventoryMusdCids
+
+        -- Return change to operator if inventory exceeds stake amount
+        let change = totalInventory - stakeAmount
+        if change > 0.0
+          then do
+            create CantonMUSD with
+              issuer = operator
+              owner = operator
+              amount = change
+              agreementHash = mpaHash
+              agreementUri = mpaUri
+              privacyObservers = []
+            pure ()
+          else pure ()
+
+        -- Calculate shares (same as Stake)
+        let localSharePrice = if totalShares > 0.0 then pooledMusd / totalShares else 1.0
+        let newShares = stakeAmount / localSharePrice
+
+        -- Deposit into pool vault (same as Stake):
+        --   Create pool-held mUSD (operator-owned — vault holds the tokens)
+        --   Merge with existing vault balance
+        poolDeposit <- create CantonMUSD with
+          issuer = operator
+          owner = operator
+          amount = stakeAmount
+          agreementHash = mpaHash
+          agreementUri = mpaUri
+          privacyObservers = []
+        newPoolCid <- case poolMusdCid of
+          None -> return poolDeposit
+          Some existingCid -> exercise existingCid CantonMUSD_Merge with otherCid = poolDeposit
+
+        -- Issue smUSD shares
+        now <- getTime
+        userObs <- lookupUserObservers operator user None
+        smusdCid <- create CantonSMUSD with
+          issuer = operator
+          owner = user
+          shares = newShares
+          entrySharePrice = localSharePrice
+          stakedAt = now
+          complianceRegistryCid = complianceRegistryCid
+          privacyObservers = userObs
+
+        -- Update pool state: mUSD deposited in vault, shares issued
+        newService <- create this with
+          totalShares = totalShares + newShares
+          pooledMusd = pooledMusd + stakeAmount
+          poolMusdCid = Some newPoolCid
+
+        return (newService, smusdCid)
+
+    -- | Unstake: smUSD shares → mUSD withdrawn from vault
+    -- User redeems shares for proportional mUSD from the pool vault (fully backed).
+    -- mUSD comes from the vault's held CantonMUSD — not minted from nothing.
+    -- Mirrors Ethereum SMUSD ERC-4626 withdraw() pattern.
+    -- FIX D-M01: Enforce cooldown period symmetry with Solidity's 24h unstake cooldown
+    choice Unstake : (ContractId CantonStakingService, ContractId CantonMUSD)
+      with
+        user : Party
+        smusdCid : ContractId CantonSMUSD
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+
+        -- DAML-H-04: Mandatory compliance check — unstaker must not be blacklisted/frozen
+        exercise complianceRegistryCid ValidateRedemption with redeemer = user
+
+        smusd <- fetch smusdCid
+        assertMsg "OWNER_MISMATCH" (smusd.owner == user)
+
+        -- FIX D-M01: Enforce cooldown period before allowing unstake
+        now <- getTime
+        let cooldownRel = seconds cooldownSeconds
+        let elapsed = subTime now smusd.stakedAt
+        assertMsg "COOLDOWN_NOT_ELAPSED" (elapsed >= cooldownRel)
+
+        -- Calculate mUSD withdrawal from vault (pro-rata, fully backed)
+        let remainingShares = totalShares - smusd.shares
+        let musdAmount = if totalShares > 0.0
+              then pooledMusd * smusd.shares / totalShares
+              else 0.0
+        assertMsg "ZERO_WITHDRAWAL" (musdAmount > 0.0)
+
+        -- Archive smUSD shares (burned on exit)
+        archive smusdCid
+
+        -- Withdraw mUSD from pool vault:
+        --   Vault's CantonMUSD is consumed and re-created with reduced balance.
+        --   User receives a new CantonMUSD — backed by real vault holdings.
+        poolCid <- case poolMusdCid of
+          None -> abort "NO_POOL_MUSD"
+          Some cid -> return cid
+        poolMusd <- fetch poolCid
+        archive poolCid
+
+        -- Last staker: take full vault balance (avoids rounding dust)
+        let withdrawalAmount = if remainingShares <= 0.0 || poolMusd.amount <= musdAmount
+              then poolMusd.amount else musdAmount
+        userObs <- lookupUserObservers operator user None
+        userMusdCid <- create CantonMUSD with
+          issuer = operator
+          owner = user
+          amount = withdrawalAmount
+          agreementHash = mpaHash
+          agreementUri = mpaUri
+          privacyObservers = userObs
+
+        -- Recreate remaining vault balance if shares remain
+        (newPoolCid, newPooledMusd) <- if remainingShares <= 0.0 || poolMusd.amount <= musdAmount
+          then return (None, 0.0)
+          else do
+            let remaining = poolMusd.amount - musdAmount
+            cid <- create CantonMUSD with
+              issuer = operator
+              owner = operator
+              amount = remaining
+              agreementHash = mpaHash
+              agreementUri = mpaUri
+              privacyObservers = []
+            return (Some cid, remaining)
+
+        newService <- create this with
+          totalShares = remainingShares
+          pooledMusd = newPooledMusd
+          poolMusdCid = newPoolCid
+
+        return (newService, userMusdCid)
+
+    -- | Unstake_Batch — Option 2 batch extension for fragmented smUSD positions.
+    --
+    -- Redeems multiple smUSD contracts in a single atomic transaction and
+    -- withdraws exactly `requestedMusd` from the vault.  All existing
+    -- Unstake invariants are enforced per token:
+    --   - Ownership: every token must belong to `user`
+    --   - Cooldown: every token must have passed cooldownSeconds since stakedAt
+    --   - Issuer: every token must be issued by `operator`
+    --
+    -- Additional batch invariants:
+    --   - At least one smusdCid must be provided
+    --   - Combined mUSD value (at current share price) >= requestedMusd
+    --   - requestedMusd > 0
+    --
+    -- On success:
+    --   - All provided smUSD tokens are archived
+    --   - Exactly `requestedMusd` mUSD is withdrawn from the vault and sent to user
+    --   - Service totalShares / pooledMusd updated proportionally
+    --
+    -- Excess vault value (if total > requestedMusd) remains in the pool
+    -- for remaining stakers — the extra shares are consumed but the extra
+    -- mUSD stays in the vault, slightly increasing the remaining share price.
+    -- Callers should use SMUSD_Split beforehand to avoid leaving yield behind.
+    choice Unstake_Batch : (ContractId CantonStakingService, ContractId CantonMUSD)
+      with
+        user          : Party
+        smusdCids     : [ContractId CantonSMUSD]  -- One or more smUSD positions
+        requestedMusd : Money                      -- Exact mUSD amount user wants
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        assertMsg "NO_POSITIONS_PROVIDED" (not (null smusdCids))
+        assertMsg "REQUESTED_AMOUNT_POSITIVE" (requestedMusd > 0.0)
+
+        exercise complianceRegistryCid ValidateRedemption with redeemer = user
+
+        now <- getTime
+        let cooldownRel = seconds cooldownSeconds
+
+        -- Validate each smUSD: ownership, issuer, cooldown
+        let validatePos cid = do
+              smusd <- fetch cid
+              assertMsg "OWNER_MISMATCH" (smusd.owner == user)
+              assertMsg "ISSUER_MISMATCH" (smusd.issuer == operator)
+              let elapsed = subTime now smusd.stakedAt
+              assertMsg "COOLDOWN_NOT_ELAPSED" (elapsed >= cooldownRel)
+              return smusd.shares
+
+        sharesPerToken <- mapA validatePos smusdCids
+
+        let totalSharesProvided = foldl (+) 0.0 sharesPerToken
+
+        -- Compute combined mUSD value from vault (pool-derived price, same as Unstake)
+        let totalMusdValue = if totalShares > 0.0
+              then pooledMusd * totalSharesProvided / totalShares
+              else 0.0
+
+        assertMsg "INSUFFICIENT_BALANCE" (totalMusdValue >= requestedMusd)
+        assertMsg "ZERO_WITHDRAWAL" (requestedMusd > 0.0)
+
+        -- Archive all provided smUSD positions
+        _ <- mapA archive smusdCids
+
+        -- Withdraw from vault
+        poolCid <- case poolMusdCid of
+          None -> abort "NO_POOL_MUSD"
+          Some cid -> return cid
+        poolMusd <- fetch poolCid
+        archive poolCid
+
+        userObs <- lookupUserObservers operator user None
+        userMusdCid2 <- create CantonMUSD with
+          issuer        = operator
+          owner         = user
+          amount        = requestedMusd
+          agreementHash = mpaHash
+          agreementUri  = mpaUri
+          privacyObservers = userObs
+
+        -- Recreate remaining vault balance
+        let remainingVault = poolMusd.amount - requestedMusd
+        let newRemainingShares = totalShares - totalSharesProvided
+        (newPoolCid2, newPooledMusd2) <-
+          if remainingVault <= 0.0
+            then return (None, 0.0)
+            else do
+              cid <- create CantonMUSD with
+                issuer        = operator
+                owner         = operator
+                amount        = remainingVault
+                agreementHash = mpaHash
+                agreementUri  = mpaUri
+                privacyObservers = []
+              return (Some cid, remainingVault)
+
+        newService <- create this with
+          totalShares = if newRemainingShares > 0.0 then newRemainingShares else 0.0
+          pooledMusd  = newPooledMusd2
+          poolMusdCid = newPoolCid2
+
+        return (newService, userMusdCid2)
+
+    -- | Sync global share price from Ethereum (informational / cross-chain validation)
+    -- The actual stake/unstake price is derived from pooledMusd / totalShares.
+    -- This sync serves as a cross-chain consistency check and for display purposes.
+    -- FIX HIGH-07: Requires governance co-approval — prevents unilateral operator manipulation
+    choice SyncGlobalSharePrice : ContractId CantonStakingService
+      with
+        newGlobalSharePrice : Money   -- Global share price from Ethereum
+        newGlobalTotalAssets : Money  -- Total assets across both chains
+        newGlobalTotalShares : Money  -- Total shares across both chains
+        epochNumber : Int             -- Must be sequential
+        attestationHash : Text        -- FIX D-M-02: Validator attestation hash (SHA-256 of price data)
+        validatorCount : Int          -- FIX D-M-02: Number of validators who signed this attestation
+      controller operator, governance
+      do
+        assertMsg "EPOCH_NOT_SEQUENTIAL" (epochNumber > lastSyncEpoch)
+        assertMsg "SHARE_PRICE_MUST_BE_POSITIVE" (newGlobalSharePrice > 0.0)
+        -- FIX D-M-02: Require BFT supermajority attestation (at least 3 validators)
+        assertMsg "ATTESTATION_HASH_REQUIRED" (attestationHash /= "")
+        assertMsg "INSUFFICIENT_VALIDATOR_ATTESTATION" (validatorCount >= 3)
+        -- FIX D-M05: Allow share price decrease for slashing/loss events, but cap at 10% max decrease
+        let minAllowedPrice = globalSharePrice * 0.9
+        assertMsg "SHARE_PRICE_DECREASE_TOO_LARGE" (newGlobalSharePrice >= minAllowedPrice)
+        -- FIX D-M09: Cap share price increase at 10% per epoch to prevent manipulation
+        let maxAllowedPrice = globalSharePrice * 1.1
+        assertMsg "SHARE_PRICE_INCREASE_TOO_LARGE" (newGlobalSharePrice <= maxAllowedPrice)
+
+        create this with
+          globalSharePrice = newGlobalSharePrice
+          globalTotalAssets = newGlobalTotalAssets
+          globalTotalShares = newGlobalTotalShares
+          lastSyncEpoch = epochNumber
+
+    -- | Legacy SyncYield for backwards compatibility (deprecated)
+    -- FIX C-DAML-03: Require governance co-signature (matches SyncGlobalSharePrice)
+    choice SyncYield : ContractId CantonStakingService
+      with
+        newTotalTreasuryAssets : Money
+        yieldAccrued : Money
+        epochNumber : Int
+      controller operator, governance
+      do
+        assertMsg "EPOCH_NOT_SEQUENTIAL" (epochNumber > lastSyncEpoch)
+        -- Convert to global share price model
+        let newSharePrice = if globalTotalShares > 0.0
+              then newTotalTreasuryAssets / globalTotalShares
+              else globalSharePrice
+        -- SECURITY FIX DAML-H-04: Apply same share price bounds as SyncGlobalSharePrice.
+        -- Without bounds, a malicious or buggy oracle could set an extreme value,
+        -- causing massive over/under-payments on unstake.
+        let minAllowedPrice = globalSharePrice * 0.9
+        let maxAllowedPrice = globalSharePrice * 1.1
+        assertMsg "SYNC_YIELD_PRICE_DECREASE_TOO_LARGE" (newSharePrice >= minAllowedPrice)
+        assertMsg "SYNC_YIELD_PRICE_INCREASE_TOO_LARGE" (newSharePrice <= maxAllowedPrice)
+        create this with
+          globalSharePrice = newSharePrice
+          globalTotalAssets = newTotalTreasuryAssets
+          lastSyncEpoch = epochNumber
+
+    -- | Receive yield mUSD from Ethereum bridge into the vault.
+    -- Called by operator+governance after bridged yield CantonMUSD arrives on Canton.
+    -- Yield mUSD is merged into the vault's held CantonMUSD — vault grows, share price rises.
+    -- Mirrors SMUSD.distributeYield() on Ethereum (ERC-4626 pattern).
+    -- Yield cap: max 10% of pool per call (matches Ethereum MAX_YIELD_BPS).
+    choice ReceiveYield : ContractId CantonStakingService
+      with
+        yieldMusdCid : ContractId CantonMUSD
+      controller operator, governance
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        musd <- fetch yieldMusdCid
+        assertMsg "ISSUER_MISMATCH" (musd.issuer == operator)
+        assertMsg "OWNER_MISMATCH" (musd.owner == operator)
+        assertMsg "ZERO_YIELD" (musd.amount > 0.0)
+        -- Cap yield per call at 10% of current pool (prevents manipulation)
+        let maxYield = if pooledMusd > 0.0 then pooledMusd * 0.1 else musd.amount
+        assertMsg "YIELD_EXCEEDS_MAX" (musd.amount <= maxYield)
+        -- Merge yield mUSD into vault — vault grows, share price rises
+        newPoolCid <- case poolMusdCid of
+          None -> return yieldMusdCid
+          Some existingCid -> exercise existingCid CantonMUSD_Merge with otherCid = yieldMusdCid
+        create this with
+          pooledMusd = pooledMusd + musd.amount
+          poolMusdCid = Some newPoolCid
+
+    -- | Admin: Pause/unpause
+    choice Staking_SetPaused : ContractId CantonStakingService
+      with
+        newPaused : Bool
+      controller operator
+      do
+        create this with paused = newPaused

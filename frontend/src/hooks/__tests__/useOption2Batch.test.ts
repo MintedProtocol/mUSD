@@ -29,7 +29,7 @@ import {
   largestSingleAmount,
   consolidateTokens,
   isLastStakerPartialForbidden,
-  selectCoveringCids,
+  selectMinForfeitCoveringCids,
   mapBatchUnstakeError,
   LAST_STAKER_PARTIAL_MSG,
   type BatchProgress,
@@ -545,44 +545,65 @@ describe("mapBatchUnstakeError", () => {
   });
 });
 
-// ── Batch CID selection (Option2 batch path) ────────────────────────────
+// ── Batch CID selection: forfeit-minimising (Option2 batch path) ─────────
 
-describe("selectCoveringCids", () => {
+describe("selectMinForfeitCoveringCids", () => {
   it("returns single CID for exact-match token", () => {
     const tokens = [makeToken("cid1", 50), makeToken("cid2", 100)];
-    expect(selectCoveringCids(tokens, 100)).toEqual(["cid2"]);
+    expect(selectMinForfeitCoveringCids(tokens, 100)).toEqual(["cid2"]);
   });
 
-  it("returns minimal covering set, largest first", () => {
-    // Need 80: pick 50 (largest) then 40 → total 90 ≥ 80
+  it("prefers exact match over smaller covering tokens", () => {
+    // 100 is exact, 200 also covers — exact match wins (zero forfeit)
+    const tokens = [makeToken("big", 200), makeToken("exact", 100), makeToken("small", 30)];
+    expect(selectMinForfeitCoveringCids(tokens, 100)).toEqual(["exact"]);
+  });
+
+  it("prefers smallest single covering token when no exact match", () => {
+    // Need 80: tokens 90, 150, 200 all cover. Pick 90 (least overshoot = 10)
+    const tokens = [makeToken("a", 200), makeToken("b", 90), makeToken("c", 150)];
+    expect(selectMinForfeitCoveringCids(tokens, 80)).toEqual(["b"]);
+  });
+
+  it("accumulates from smallest upward when no single token covers", () => {
+    // Need 80: tokens 30, 40, 50 — none covers alone.
+    // Smallest-first: 30 + 40 = 70 (not enough), + 50 = 120 → done.
+    // All 3 needed. But order is ascending: 30, 40, 50.
     const tokens = [makeToken("a", 30), makeToken("b", 50), makeToken("c", 40)];
-    const result = selectCoveringCids(tokens, 80);
-    expect(result).toEqual(["b", "c"]);
+    const result = selectMinForfeitCoveringCids(tokens, 80);
+    expect(result).toEqual(["a", "c", "b"]); // ascending by amount
   });
 
-  it("returns all CIDs when all needed to cover", () => {
-    const tokens = [makeToken("a", 10), makeToken("b", 20), makeToken("c", 30)];
-    const result = selectCoveringCids(tokens, 60);
-    expect(result).toEqual(["c", "b", "a"]);
+  it("accumulates minimal set from smallest upward", () => {
+    // Need 60: tokens 10, 20, 30, 50.
+    // Smallest-first: 10 + 20 = 30, + 30 = 60 → covered. Stops, doesn't include 50.
+    const tokens = [makeToken("d", 50), makeToken("a", 10), makeToken("b", 20), makeToken("c", 30)];
+    const result = selectMinForfeitCoveringCids(tokens, 60);
+    expect(result).toEqual(["a", "b", "c"]);
   });
 
   it("returns empty array when total is insufficient", () => {
     const tokens = [makeToken("a", 10), makeToken("b", 20)];
-    expect(selectCoveringCids(tokens, 50)).toEqual([]);
+    expect(selectMinForfeitCoveringCids(tokens, 50)).toEqual([]);
   });
 
   it("returns empty array for zero requested amount", () => {
     const tokens = [makeToken("a", 100)];
-    expect(selectCoveringCids(tokens, 0)).toEqual([]);
+    expect(selectMinForfeitCoveringCids(tokens, 0)).toEqual([]);
   });
 
   it("skips zero-amount tokens", () => {
     const tokens = [makeToken("a", 0), makeToken("b", 100), makeToken("c", 0)];
-    expect(selectCoveringCids(tokens, 50)).toEqual(["b"]);
+    expect(selectMinForfeitCoveringCids(tokens, 50)).toEqual(["b"]);
   });
 
-  it("picks single oversized token (no need to include extras)", () => {
-    const tokens = [makeToken("a", 200), makeToken("b", 10)];
-    expect(selectCoveringCids(tokens, 50)).toEqual(["a"]);
+  it("returns empty array for empty token list", () => {
+    expect(selectMinForfeitCoveringCids([], 50)).toEqual([]);
+  });
+
+  it("handles near-epsilon exact match", () => {
+    // Token amount differs from requested by less than EPSILON (0.000001)
+    const tokens = [makeToken("cid1", 100.0000005)];
+    expect(selectMinForfeitCoveringCids(tokens, 100)).toEqual(["cid1"]);
   });
 });

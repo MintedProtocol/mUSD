@@ -14,7 +14,7 @@ import {
 import {
   OPTION2_BATCH_ENABLED,
   isLastStakerPartialForbidden,
-  selectCoveringCids,
+  selectMinForfeitCoveringCids,
   mapBatchUnstakeError,
 } from "@/hooks/useOption2Batch";
 
@@ -282,8 +282,8 @@ export function CantonStake() {
           throw new Error(mapBatchUnstakeError("LAST_STAKER_PARTIAL_FORBIDDEN", "Partial unstake blocked"));
         }
 
-        // Select minimal covering CID set (greedy largest-first)
-        const cids = selectCoveringCids(freshSmusd, parsedAmount);
+        // Select least-forfeit covering CID set
+        const cids = selectMinForfeitCoveringCids(freshSmusd, parsedAmount);
         if (cids.length === 0) throw new Error("No smUSD shares available.");
 
         // Submit to batch endpoint
@@ -297,11 +297,26 @@ export function CantonStake() {
             requestedMusd: requestedMusd.toString(),
           }),
         });
-        const data = await resp.json();
-        if (!data.success) {
-          throw new Error(mapBatchUnstakeError(data.errorType || "", data.error || "Batch unstake failed"));
+
+        // Harden: validate content-type before parsing JSON
+        const ct = resp.headers.get("content-type") || "";
+        if (!ct.includes("application/json")) {
+          const text = await resp.text().catch(() => "Unknown error");
+          throw new Error(mapBatchUnstakeError("", `HTTP ${resp.status}: ${text.slice(0, 300)}`));
         }
-        setTxSuccess(`Unstaked ${fmtAmount(parsedAmount, 4)} smUSD → ~${fmtAmount(requestedMusd)} mUSD`);
+        let data: Record<string, unknown>;
+        try {
+          data = await resp.json();
+        } catch {
+          throw new Error(mapBatchUnstakeError("", `HTTP ${resp.status}: Invalid JSON response`));
+        }
+        if (!data.success) {
+          throw new Error(mapBatchUnstakeError(
+            (data.errorType as string) || "",
+            (data.error as string) || "Batch unstake failed",
+          ));
+        }
+        setTxSuccess(`Unstaked ${fmtAmount(parsedAmount, 4)} smUSD (batch)`);
       } else {
         // ── Legacy: single-position unstake ──
         const smusd = pickCoveringToken(freshSmusd, parsedAmount);

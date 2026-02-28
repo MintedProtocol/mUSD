@@ -405,24 +405,45 @@ export function largestSingleAmount(
   return tokens.reduce((max, t) => Math.max(max, parseAmt(t)), 0);
 }
 
-// ── Batch CID selection ──────────────────────────────────────────────
+// ── Batch CID selection (forfeit-minimising) ────────────────────────
 
 /**
- * Select a minimal covering set of token CIDs whose total amount >= requested.
- * Greedily picks the largest tokens first. Returns empty array if the total
- * is insufficient.
+ * Select token CIDs that cover `requested` with the least excess (forfeit).
+ *
+ * DAML `Unstake_Batch` burns ALL provided positions. Any value above the
+ * requested mUSD is forfeited — it is NOT returned to the user. Therefore
+ * we minimise excess with this priority:
+ *
+ *   1. Exact match — a single token whose amount ≈ requested (zero forfeit)
+ *   2. Smallest single covering — the smallest token ≥ requested (least overshoot)
+ *   3. Accumulate from smallest upward — greedy smallest-first minimises the
+ *      total included and stops as soon as the sum covers the request
+ *
+ * Returns empty array when the total balance is insufficient.
  */
-export function selectCoveringCids(
+export function selectMinForfeitCoveringCids(
   tokens: (SimpleToken | CantonMUSDToken)[],
   requested: number,
 ): string[] {
   if (requested <= 0) return [];
-  const sorted = [...tokens]
-    .filter((t) => parseAmt(t) > 0)
-    .sort((a, b) => parseAmt(b) - parseAmt(a));
+  const positive = tokens.filter((t) => parseAmt(t) > 0);
+  if (positive.length === 0) return [];
+
+  // 1. Exact match
+  const exact = positive.find((t) => Math.abs(parseAmt(t) - requested) < EPSILON);
+  if (exact) return [exact.contractId];
+
+  // 2. Smallest single covering token (least overshoot)
+  const covering = positive
+    .filter((t) => parseAmt(t) >= requested - EPSILON)
+    .sort((a, b) => parseAmt(a) - parseAmt(b));
+  if (covering.length > 0) return [covering[0].contractId];
+
+  // 3. Accumulate from smallest upward
+  const ascending = [...positive].sort((a, b) => parseAmt(a) - parseAmt(b));
   const cids: string[] = [];
   let total = 0;
-  for (const t of sorted) {
+  for (const t of ascending) {
     cids.push(t.contractId);
     total += parseAmt(t);
     if (total >= requested - EPSILON) return cids;

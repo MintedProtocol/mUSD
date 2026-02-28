@@ -14,7 +14,7 @@ import {
 import {
   OPTION2_BATCH_ENABLED,
   isLastStakerPartialForbidden,
-  LAST_STAKER_PARTIAL_MSG,
+  selectCoveringCids,
   mapBatchUnstakeError,
 } from "@/hooks/useOption2Batch";
 
@@ -269,42 +269,58 @@ export function CantonStake() {
       if (!freshService) throw new Error("Staking service not found");
       const freshSmusd = fresh.smusdTokens || [];
 
-      // ── Option 2: last-staker partial guard ──
       if (OPTION2_BATCH_ENABLED) {
+        // ── Option 2: batch unstake path ──
         const userShares = freshSmusd.reduce((s, t) => s + parseTokenAmount(t), 0);
         const poolTotal = parseFloat(freshService.totalShares || "0");
         const sharePrice = parseFloat(freshService.sharePrice || "1");
         const requestedMusd = parsedAmount * sharePrice;
         const pooledMusd = parseFloat(freshService.pooledMusd || "0");
-        if (isLastStakerPartialForbidden(userShares, poolTotal, requestedMusd, pooledMusd)) {
-          throw new Error(LAST_STAKER_PARTIAL_MSG);
-        }
-      }
 
-      const smusd = pickCoveringToken(freshSmusd, parsedAmount);
-      if (!smusd) {
-        const largest = freshSmusd.reduce((max, t) => Math.max(max, parseTokenAmount(t)), 0);
-        throw new Error(
-          largest > 0
-            ? `No single smUSD contract covers ${fmtAmount(parsedAmount, 4)}. Largest is ${fmtAmount(largest, 4)} smUSD.`
-            : "No smUSD shares available."
-        );
-      }
-      const resp = await cantonExercise("CantonStakingService", freshService.contractId, "Unstake", {
-        user: fresh.party, smusdCid: smusd.contractId,
-      }, { party: fresh.party });
-      if (!resp.success) throw new Error(resp.error || "Unstake failed");
-      setTxSuccess(`Unstaked ${fmtAmount(parsedAmount, 4)} smUSD → mUSD`);
-      setAmount("");
-      await refresh();
-    } catch (err: any) {
-      const msg = err.message || "";
-      if (OPTION2_BATCH_ENABLED && msg.includes("LAST_STAKER_PARTIAL_FORBIDDEN")) {
-        setTxError(LAST_STAKER_PARTIAL_MSG);
+        // Pre-submit: last-staker partial guard
+        if (isLastStakerPartialForbidden(userShares, poolTotal, requestedMusd, pooledMusd)) {
+          throw new Error(mapBatchUnstakeError("LAST_STAKER_PARTIAL_FORBIDDEN", "Partial unstake blocked"));
+        }
+
+        // Select minimal covering CID set (greedy largest-first)
+        const cids = selectCoveringCids(freshSmusd, parsedAmount);
+        if (cids.length === 0) throw new Error("No smUSD shares available.");
+
+        // Submit to batch endpoint
+        const resp = await fetch("/api/canton-batch-unstake", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            party: fresh.party,
+            pool: "smusd",
+            contractIds: cids,
+            requestedMusd: requestedMusd.toString(),
+          }),
+        });
+        const data = await resp.json();
+        if (!data.success) {
+          throw new Error(mapBatchUnstakeError(data.errorType || "", data.error || "Batch unstake failed"));
+        }
+        setTxSuccess(`Unstaked ${fmtAmount(parsedAmount, 4)} smUSD → ~${fmtAmount(requestedMusd)} mUSD`);
       } else {
-        setTxError(msg);
+        // ── Legacy: single-position unstake ──
+        const smusd = pickCoveringToken(freshSmusd, parsedAmount);
+        if (!smusd) {
+          const largest = freshSmusd.reduce((max, t) => Math.max(max, parseTokenAmount(t)), 0);
+          throw new Error(
+            largest > 0
+              ? `No single smUSD contract covers ${fmtAmount(parsedAmount, 4)}. Largest is ${fmtAmount(largest, 4)} smUSD.`
+              : "No smUSD shares available."
+          );
+        }
+        const resp = await cantonExercise("CantonStakingService", freshService.contractId, "Unstake", {
+          user: fresh.party, smusdCid: smusd.contractId,
+        }, { party: fresh.party });
+        if (!resp.success) throw new Error(resp.error || "Unstake failed");
+        setTxSuccess(`Unstaked ${fmtAmount(parsedAmount, 4)} smUSD → mUSD`);
       }
-    }
+      setAmount(""); await refresh();
+    } catch (err: any) { setTxError(err.message || "Unstake failed"); }
     finally { setTxLoading(false); }
   }
 

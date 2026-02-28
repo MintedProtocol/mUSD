@@ -405,6 +405,31 @@ export function largestSingleAmount(
   return tokens.reduce((max, t) => Math.max(max, parseAmt(t)), 0);
 }
 
+// ── Batch CID selection ──────────────────────────────────────────────
+
+/**
+ * Select a minimal covering set of token CIDs whose total amount >= requested.
+ * Greedily picks the largest tokens first. Returns empty array if the total
+ * is insufficient.
+ */
+export function selectCoveringCids(
+  tokens: (SimpleToken | CantonMUSDToken)[],
+  requested: number,
+): string[] {
+  if (requested <= 0) return [];
+  const sorted = [...tokens]
+    .filter((t) => parseAmt(t) > 0)
+    .sort((a, b) => parseAmt(b) - parseAmt(a));
+  const cids: string[] = [];
+  let total = 0;
+  for (const t of sorted) {
+    cids.push(t.contractId);
+    total += parseAmt(t);
+    if (total >= requested - EPSILON) return cids;
+  }
+  return []; // insufficient total
+}
+
 // ── Last-staker partial guard ────────────────────────────────────────
 
 export const LAST_STAKER_PARTIAL_MSG =

@@ -29,6 +29,7 @@ import {
   largestSingleAmount,
   consolidateTokens,
   isLastStakerPartialForbidden,
+  selectCoveringCids,
   mapBatchUnstakeError,
   LAST_STAKER_PARTIAL_MSG,
   type BatchProgress,
@@ -536,5 +537,52 @@ describe("mapBatchUnstakeError", () => {
   it("returns fallback for INSUFFICIENT_BALANCE", () => {
     expect(mapBatchUnstakeError("INSUFFICIENT_BALANCE", "Not enough funds"))
       .toBe("Not enough funds");
+  });
+
+  it("returns fallback for FEATURE_DISABLED (server batch flag off)", () => {
+    expect(mapBatchUnstakeError("FEATURE_DISABLED", "Batch choices not enabled"))
+      .toBe("Batch choices not enabled");
+  });
+});
+
+// ── Batch CID selection (Option2 batch path) ────────────────────────────
+
+describe("selectCoveringCids", () => {
+  it("returns single CID for exact-match token", () => {
+    const tokens = [makeToken("cid1", 50), makeToken("cid2", 100)];
+    expect(selectCoveringCids(tokens, 100)).toEqual(["cid2"]);
+  });
+
+  it("returns minimal covering set, largest first", () => {
+    // Need 80: pick 50 (largest) then 40 → total 90 ≥ 80
+    const tokens = [makeToken("a", 30), makeToken("b", 50), makeToken("c", 40)];
+    const result = selectCoveringCids(tokens, 80);
+    expect(result).toEqual(["b", "c"]);
+  });
+
+  it("returns all CIDs when all needed to cover", () => {
+    const tokens = [makeToken("a", 10), makeToken("b", 20), makeToken("c", 30)];
+    const result = selectCoveringCids(tokens, 60);
+    expect(result).toEqual(["c", "b", "a"]);
+  });
+
+  it("returns empty array when total is insufficient", () => {
+    const tokens = [makeToken("a", 10), makeToken("b", 20)];
+    expect(selectCoveringCids(tokens, 50)).toEqual([]);
+  });
+
+  it("returns empty array for zero requested amount", () => {
+    const tokens = [makeToken("a", 100)];
+    expect(selectCoveringCids(tokens, 0)).toEqual([]);
+  });
+
+  it("skips zero-amount tokens", () => {
+    const tokens = [makeToken("a", 0), makeToken("b", 100), makeToken("c", 0)];
+    expect(selectCoveringCids(tokens, 50)).toEqual(["b"]);
+  });
+
+  it("picks single oversized token (no need to include extras)", () => {
+    const tokens = [makeToken("a", 200), makeToken("b", 10)];
+    expect(selectCoveringCids(tokens, 50)).toEqual(["a"]);
   });
 });

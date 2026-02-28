@@ -456,6 +456,9 @@ export function selectMinForfeitCoveringCids(
 export const LAST_STAKER_PARTIAL_MSG =
   "You hold all pool shares. Partial batch unstake is not allowed. Use full vault amount.";
 
+export const FEATURE_DISABLED_MSG =
+  "Batch unstake is not currently available. Please try again later or use a single position.";
+
 /**
  * Returns true when the unstake should be blocked because the user is
  * effectively the last staker requesting a partial withdrawal.
@@ -485,5 +488,6 @@ export function mapBatchUnstakeError(
   fallbackMessage: string,
 ): string {
   if (errorType === "LAST_STAKER_PARTIAL_FORBIDDEN") return LAST_STAKER_PARTIAL_MSG;
+  if (errorType === "FEATURE_DISABLED") return FEATURE_DISABLED_MSG;
   return fallbackMessage;
 }

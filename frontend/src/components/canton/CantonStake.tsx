@@ -811,6 +811,9 @@ export function CantonStake() {
                               </div>
                             </div>
                           </div>
+                          {OPTION2_BATCH_ENABLED && (
+                            <p className="text-xs text-yellow-400/80">Batch unstake may forfeit excess value if selected positions exceed requested amount.</p>
+                          )}
                           <TxButton onClick={handleSmusdUnstake} loading={txLoading} disabled={smusdTokens.length === 0 || parsedAmount <= 0} className="w-full">
                             <span className="flex items-center justify-center gap-2">
                               <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>

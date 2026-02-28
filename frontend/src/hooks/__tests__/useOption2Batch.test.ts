@@ -32,6 +32,7 @@ import {
   selectMinForfeitCoveringCids,
   mapBatchUnstakeError,
   LAST_STAKER_PARTIAL_MSG,
+  FEATURE_DISABLED_MSG,
   type BatchProgress,
 } from "../useOption2Batch";
 
@@ -539,9 +540,9 @@ describe("mapBatchUnstakeError", () => {
       .toBe("Not enough funds");
   });
 
-  it("returns fallback for FEATURE_DISABLED (server batch flag off)", () => {
-    expect(mapBatchUnstakeError("FEATURE_DISABLED", "Batch choices not enabled"))
-      .toBe("Batch choices not enabled");
+  it("maps FEATURE_DISABLED to user-facing message", () => {
+    expect(mapBatchUnstakeError("FEATURE_DISABLED", "raw server msg"))
+      .toBe(FEATURE_DISABLED_MSG);
   });
 });
 

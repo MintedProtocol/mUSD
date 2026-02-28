@@ -11,6 +11,12 @@ import {
   type CantonBalancesData,
   type SimpleToken,
 } from "@/hooks/useCantonLedger";
+import {
+  OPTION2_BATCH_ENABLED,
+  isLastStakerPartialForbidden,
+  LAST_STAKER_PARTIAL_MSG,
+  mapBatchUnstakeError,
+} from "@/hooks/useOption2Batch";
 
 type CantonPoolTab = "smusd" | "ethpool" | "boostpool";
 type StakeAction = "stake" | "unstake";
@@ -262,6 +268,19 @@ export function CantonStake() {
       }
       if (!freshService) throw new Error("Staking service not found");
       const freshSmusd = fresh.smusdTokens || [];
+
+      // ── Option 2: last-staker partial guard ──
+      if (OPTION2_BATCH_ENABLED) {
+        const userShares = freshSmusd.reduce((s, t) => s + parseTokenAmount(t), 0);
+        const poolTotal = parseFloat(freshService.totalShares || "0");
+        const sharePrice = parseFloat(freshService.sharePrice || "1");
+        const requestedMusd = parsedAmount * sharePrice;
+        const pooledMusd = parseFloat(freshService.pooledMusd || "0");
+        if (isLastStakerPartialForbidden(userShares, poolTotal, requestedMusd, pooledMusd)) {
+          throw new Error(LAST_STAKER_PARTIAL_MSG);
+        }
+      }
+
       const smusd = pickCoveringToken(freshSmusd, parsedAmount);
       if (!smusd) {
         const largest = freshSmusd.reduce((max, t) => Math.max(max, parseTokenAmount(t)), 0);
@@ -278,7 +297,14 @@ export function CantonStake() {
       setTxSuccess(`Unstaked ${fmtAmount(parsedAmount, 4)} smUSD → mUSD`);
       setAmount("");
       await refresh();
-    } catch (err: any) { setTxError(err.message); }
+    } catch (err: any) {
+      const msg = err.message || "";
+      if (OPTION2_BATCH_ENABLED && msg.includes("LAST_STAKER_PARTIAL_FORBIDDEN")) {
+        setTxError(LAST_STAKER_PARTIAL_MSG);
+      } else {
+        setTxError(msg);
+      }
+    }
     finally { setTxLoading(false); }
   }
 

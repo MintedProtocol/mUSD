@@ -404,3 +404,40 @@ export function largestSingleAmount(
 ): number {
   return tokens.reduce((max, t) => Math.max(max, parseAmt(t)), 0);
 }
+
+// ── Last-staker partial guard ────────────────────────────────────────
+
+export const LAST_STAKER_PARTIAL_MSG =
+  "You hold all pool shares. Partial batch unstake is not allowed. Use full vault amount.";
+
+/**
+ * Returns true when the unstake should be blocked because the user is
+ * effectively the last staker requesting a partial withdrawal.
+ *
+ * Condition (mirrors DAML Unstake_Batch guard):
+ *   userShares >= poolTotalShares - epsilon   (last staker)
+ *   AND requestedMusd < pooledMusd - epsilon  (partial withdrawal)
+ */
+export function isLastStakerPartialForbidden(
+  userShares: number,
+  poolTotalShares: number,
+  requestedMusd: number,
+  pooledMusd: number,
+): boolean {
+  if (poolTotalShares <= 0) return false;
+  const isLastStaker = userShares >= poolTotalShares - EPSILON;
+  const isPartial = requestedMusd < pooledMusd - EPSILON;
+  return isLastStaker && isPartial;
+}
+
+/**
+ * Map a batch-unstake errorType to a user-facing message.
+ * Returns the fallback for unrecognised error types.
+ */
+export function mapBatchUnstakeError(
+  errorType: string,
+  fallbackMessage: string,
+): string {
+  if (errorType === "LAST_STAKER_PARTIAL_FORBIDDEN") return LAST_STAKER_PARTIAL_MSG;
+  return fallbackMessage;
+}

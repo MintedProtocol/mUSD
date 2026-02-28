@@ -28,6 +28,9 @@ import {
   needsConsolidation,
   largestSingleAmount,
   consolidateTokens,
+  isLastStakerPartialForbidden,
+  mapBatchUnstakeError,
+  LAST_STAKER_PARTIAL_MSG,
   type BatchProgress,
 } from "../useOption2Batch";
 
@@ -488,5 +491,50 @@ describe("consolidateTokens", () => {
     expect(result.contractId).toBe("cid-exact-50");
     expect(result.splitPerformed).toBe(true);
     expect(result.mergesPerformed).toBe(0);
+  });
+});
+
+// ── Last-staker partial guard ───────────────────────────────────────────
+
+describe("isLastStakerPartialForbidden", () => {
+  it("blocks last staker requesting partial withdrawal", () => {
+    // User holds 1000 shares = all pool shares, requests 800 mUSD of 1000 pooled
+    expect(isLastStakerPartialForbidden(1000, 1000, 800, 1000)).toBe(true);
+  });
+
+  it("allows last staker requesting full vault amount", () => {
+    // User holds all shares and requests the entire pooled mUSD
+    expect(isLastStakerPartialForbidden(1000, 1000, 1000, 1000)).toBe(false);
+  });
+
+  it("allows non-last-staker requesting partial withdrawal", () => {
+    // User holds 500 of 1000 total shares — not last staker
+    expect(isLastStakerPartialForbidden(500, 1000, 400, 1000)).toBe(false);
+  });
+
+  it("returns false when pool has no shares", () => {
+    expect(isLastStakerPartialForbidden(0, 0, 100, 200)).toBe(false);
+  });
+
+  it("handles near-epsilon boundary: user slightly below total shares", () => {
+    // userShares just barely under poolTotal by more than epsilon → not last staker
+    expect(isLastStakerPartialForbidden(999, 1000, 800, 1000)).toBe(false);
+  });
+});
+
+describe("mapBatchUnstakeError", () => {
+  it("maps LAST_STAKER_PARTIAL_FORBIDDEN to friendly message", () => {
+    expect(mapBatchUnstakeError("LAST_STAKER_PARTIAL_FORBIDDEN", "raw error"))
+      .toBe(LAST_STAKER_PARTIAL_MSG);
+  });
+
+  it("returns fallback for unrecognised error type", () => {
+    expect(mapBatchUnstakeError("CANTON_ERROR", "Something went wrong"))
+      .toBe("Something went wrong");
+  });
+
+  it("returns fallback for INSUFFICIENT_BALANCE", () => {
+    expect(mapBatchUnstakeError("INSUFFICIENT_BALANCE", "Not enough funds"))
+      .toBe("Not enough funds");
   });
 });

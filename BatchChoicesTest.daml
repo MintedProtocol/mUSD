@@ -1,0 +1,655 @@
+-- | BatchChoicesTest — Option 2 batch-choice regression suite.
+--
+-- Tests all four new batch choices added in ble-protocol v1.2.0:
+--   - ETHPool_BatchUnstake    (CantonETHPool)
+--   - Unstake_Batch           (CantonSMUSD / CantonStakingService)
+--   - Lending_BatchDepositSMUSD    (CantonLending)
+--   - Lending_BatchDepositSMUSDE   (CantonLending)
+--
+-- Test matrix:
+--   1. Happy path   — multiple positions, correct totals
+--   2. Insufficient — requestedMusd > total available value
+--   3. Mixed owner  — a token owned by a different user triggers OWNER_MISMATCH
+--   4. Paused       — batch on paused service triggers SERVICE_PAUSED
+--   5. Empty list   — zero positions triggers NO_POSITIONS_PROVIDED
+
+module BatchChoicesTest where
+
+import Daml.Script
+import DA.Time
+import DA.Date
+import DA.Optional (fromSome, isSome)
+import DA.Set qualified as Set
+
+import CantonDirectMint (CantonMUSD(..), CantonDirectMintService(..), Money)
+import CantonSMUSD
+  ( CantonSMUSD(..), CantonStakingService(..)
+  , Stake(..), Unstake_Batch(..)
+  , Staking_SetPaused(..)
+  )
+import CantonETHPool
+  ( CantonSMUSD_E(..), CantonETHPoolService(..), TimeLockTier(..)
+  , ETHPool_Stake(..), ETHPool_BatchUnstake(..)
+  , ETHPool_SetPaused(..)
+  )
+import CantonLending
+  ( CantonLendingService(..), EscrowedCollateral(..)
+  , LendingCollateralAggregate(..)
+  , CollateralType(..)
+  , Lending_BatchDepositSMUSD(..)
+  , Lending_BatchDepositSMUSDE(..)
+  , defaultCTNConfig, defaultUSDCConfig, defaultUSDCxConfig
+  , defaultSMUSDConfig, defaultSMUSDEConfig
+  )
+import Compliance (ComplianceRegistry(..))
+
+-- ============================================================
+--                     CONSTANTS
+-- ============================================================
+
+testMpaHash : Text
+testMpaHash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+
+testMpaUri : Text
+testMpaUri = "https://minted.app/terms"
+
+-- ============================================================
+--                     SHARED HELPERS
+-- ============================================================
+
+-- | Allocate standard parties and create a compliance registry.
+setupParties : Script (Party, Party, Party, ContractId ComplianceRegistry)
+setupParties = do
+  operator <- allocateParty "Operator"
+  alice    <- allocateParty "Alice"
+  bob      <- allocateParty "Bob"
+  regulator <- allocateParty "Regulator"
+  setTime (datetime 2026 Jan 1 0 0 0)
+  regCid <- submitMulti [regulator] [] do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.empty
+      frozen      = Set.empty
+      lastUpdated = datetime 2026 Jan 1 0 0 0
+  return (operator, alice, bob, regCid)
+
+-- | Create a CantonMUSD for a user.
+-- CantonMUSD is signatory issuer + owner, so we need both parties.
+mintMusd : Party -> Party -> Money -> Script (ContractId CantonMUSD)
+mintMusd operator user amount = do
+  submitMulti [operator, user] [] do
+    createCmd CantonMUSD with
+      issuer        = operator
+      owner         = user
+      amount
+      agreementHash = testMpaHash
+      agreementUri  = testMpaUri
+      privacyObservers = []
+
+-- | Create a CantonStakingService with no cooldown and empty pool.
+createStakingService : Party -> ContractId ComplianceRegistry -> Script (ContractId CantonStakingService)
+createStakingService operator regCid = do
+  submit operator do
+    createCmd CantonStakingService with
+      operator
+      governance          = operator
+      totalShares         = 0.0
+      pooledMusd          = 0.0
+      poolMusdCid         = None
+      globalSharePrice    = 1.0
+      globalTotalAssets   = 0.0
+      globalTotalShares   = 0.0
+      lastSyncEpoch       = 0
+      cooldownSeconds     = 0        -- No cooldown in tests
+      minDeposit          = 1.0
+      paused              = False
+      complianceRegistryCid = regCid
+      mpaHash             = testMpaHash
+      mpaUri              = testMpaUri
+      observers           = []
+
+-- | Create a CantonETHPoolService with share price 1.0 and large caps.
+createPoolService : Party -> ContractId ComplianceRegistry -> Script (ContractId CantonETHPoolService)
+createPoolService operator regCid = do
+  -- CantonETHPoolService needs a directMintServiceCid — create a dummy one
+  -- by re-using the CantonDirectMintService stub used in CantonETHPoolTest
+  -- We don't actually call DirectMint here; stake is done with existing mUSD.
+  -- The field is required by the template but only used by USDCx/USDC stake paths.
+  -- Use a placeholder by creating a real service (matches existing test pattern).
+  mintSvcCid <- setupDummyMintService operator regCid
+  submit operator do
+    createCmd CantonETHPoolService with
+      operator
+      governance              = operator
+      totalShares             = 0.0
+      totalMusdStaked         = 0.0
+      sharePrice              = 1.0
+      poolCap                 = 10_000_000.0
+      lastSyncEpoch           = 0
+      paused                  = False
+      directMintServiceCid    = mintSvcCid
+      cantonCoinPrice         = 2.0
+      complianceRegistryCid   = regCid
+      mpaHash                 = testMpaHash
+      mpaUri                  = testMpaUri
+      musdMintCap             = 10_000_000.0
+      currentUnstakeMinted    = 0.0
+      observers               = []
+
+-- | Minimal CantonDirectMintService for ETHPool creation (not exercised in batch tests).
+setupDummyMintService : Party -> ContractId ComplianceRegistry
+                      -> Script (ContractId CantonDirectMintService)
+setupDummyMintService operator regCid = do
+  submit operator do
+    createCmd CantonDirectMintService with
+      operator
+      usdcIssuer          = operator
+      usdcxIssuer         = None
+      mintFeeBps          = 0
+      redeemFeeBps        = 0
+      minAmount           = 1.0
+      maxAmount           = 100_000_000.0
+      supplyCap           = 100_000_000.0
+      currentSupply       = 0.0
+      accumulatedFees     = 0.0
+      paused              = False
+      validators          = [operator]
+      targetChainId       = 1
+      targetTreasury      = "0x0000000000000000000000000000000000000001"
+      nextNonce           = 1
+      dailyMintLimit      = 50_000_000.0
+      dailyMinted         = 0.0
+      dailyBurned         = 0.0
+      lastRateLimitReset  = datetime 2026 Jan 1 0 0 0
+      complianceRegistryCid = regCid
+      mpaHash             = testMpaHash
+      mpaUri              = testMpaUri
+      authorizedMinters   = []
+      cantonCoinPrice     = None
+      serviceName         = "test-mint"
+
+-- | Create a CantonLendingService with smUSD and smUSD-E collateral enabled.
+createLendingService : Party -> ContractId ComplianceRegistry -> Script (ContractId CantonLendingService)
+createLendingService operator regCid = do
+  submit operator do
+    createCmd CantonLendingService with
+      operator
+      configs            = [ defaultCTNConfig
+                           , defaultUSDCConfig
+                           , defaultUSDCxConfig
+                           , defaultSMUSDConfig
+                           , defaultSMUSDEConfig
+                           ]
+      totalBorrows       = 0.0
+      cantonSupplyCap    = 10_000_000.0
+      cantonCurrentSupply = 0.0
+      globalMintCap      = 50_000_000.0
+      interestRateBps    = 500
+      reserveFactorBps   = 1000
+      protocolReserves   = 0.0
+      minBorrow          = 10.0
+      closeFactorBps     = 5000
+      paused             = False
+      mpaHash            = testMpaHash
+      mpaUri             = testMpaUri
+      complianceRegistryCid = regCid
+      serviceName        = "lending"
+      observers          = []
+
+-- ============================================================
+--  1. HAPPY PATH — ETHPool_BatchUnstake
+-- ============================================================
+
+-- | Stake 3 separate 100 mUSD → 3 smUSD-E positions.
+-- Batch unstake all 3, requesting 300 mUSD. Verify correct mUSD received.
+test_ETHPool_BatchUnstake_HappyPath : Script ()
+test_ETHPool_BatchUnstake_HappyPath = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  poolSvcCid <- createPoolService operator regCid
+
+  -- Create 3 mUSD tokens for Alice (100 each)
+  m1 <- mintMusd operator alice 100.0
+  m2 <- mintMusd operator alice 100.0
+  m3 <- mintMusd operator alice 100.0
+
+  -- Stake each individually to get 3 separate smUSD-E positions
+  (poolSvcCid2, e1) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid ETHPool_Stake with
+      user = alice; musdCid = m1; selectedTier = NoLock
+  (poolSvcCid3, e2) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid2 ETHPool_Stake with
+      user = alice; musdCid = m2; selectedTier = NoLock
+  (poolSvcCid4, e3) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid3 ETHPool_Stake with
+      user = alice; musdCid = m3; selectedTier = NoLock
+
+  -- Verify service state: 300 shares (NoLock = 1.0x multiplier, sharePrice 1.0)
+  svc <- queryContractId operator poolSvcCid4
+  let s = fromSome svc
+  assertMsg "300 total shares" (s.totalShares == 300.0)
+  assertMsg "300 mUSD staked"  (s.totalMusdStaked == 300.0)
+
+  -- Batch unstake all 3 positions, requesting exactly 300 mUSD
+  (poolSvcCid5, musdOut) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid4 ETHPool_BatchUnstake with
+      user          = alice
+      smusdeCids    = [e1, e2, e3]
+      requestedMusd = 300.0
+
+  -- Verify mUSD received
+  mOut <- queryContractId alice musdOut
+  assertMsg "Received 300 mUSD" ((fromSome mOut).amount == 300.0)
+  assertMsg "mUSD owner is Alice" ((fromSome mOut).owner == alice)
+
+  -- Verify service state: all shares burned
+  svc2 <- queryContractId operator poolSvcCid5
+  let s2 = fromSome svc2
+  assertMsg "0 shares remaining" (s2.totalShares == 0.0)
+  assertMsg "300 minted tracked" (s2.currentUnstakeMinted == 300.0)
+
+  debug "✅ 1. ETHPool_BatchUnstake — happy path (3 positions, 300 mUSD)"
+
+-- ============================================================
+--  2. HAPPY PATH — Unstake_Batch (CantonStakingService)
+-- ============================================================
+
+-- | Stake 3 × 100 mUSD → 3 smUSD positions.
+-- Batch unstake all 3, requesting 300 mUSD from vault.
+test_Staking_UnstakeBatch_HappyPath : Script ()
+test_Staking_UnstakeBatch_HappyPath = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  stakeSvcCid <- createStakingService operator regCid
+
+  m1 <- mintMusd operator alice 100.0
+  m2 <- mintMusd operator alice 100.0
+  m3 <- mintMusd operator alice 100.0
+
+  (svc2, s1) <- submitMulti [alice] [operator] do
+    exerciseCmd stakeSvcCid Stake with user = alice; musdCid = m1
+  (svc3, s2) <- submitMulti [alice] [operator] do
+    exerciseCmd svc2 Stake with user = alice; musdCid = m2
+  (svc4, s3) <- submitMulti [alice] [operator] do
+    exerciseCmd svc3 Stake with user = alice; musdCid = m3
+
+  -- Verify pool: 300 shares, 300 mUSD pooled
+  poolState <- queryContractId operator svc4
+  let p = fromSome poolState
+  assertMsg "300 shares issued" (p.totalShares == 300.0)
+  assertMsg "300 mUSD in pool"  (p.pooledMusd == 300.0)
+
+  -- Batch unstake requesting 300 mUSD
+  (svc5, musdOut) <- submitMulti [alice] [operator] do
+    exerciseCmd svc4 Unstake_Batch with
+      user          = alice
+      smusdCids     = [s1, s2, s3]
+      requestedMusd = 300.0
+
+  mOut <- queryContractId alice musdOut
+  assertMsg "Received 300 mUSD" ((fromSome mOut).amount == 300.0)
+
+  -- Verify pool drained
+  poolState2 <- queryContractId operator svc5
+  let p2 = fromSome poolState2
+  assertMsg "0 shares left"    (p2.totalShares == 0.0)
+  assertMsg "0 mUSD in pool"   (p2.pooledMusd == 0.0)
+
+  debug "✅ 2. Unstake_Batch — happy path (3 positions, 300 mUSD)"
+
+-- ============================================================
+--  3. HAPPY PATH — Lending_BatchDepositSMUSD
+-- ============================================================
+
+-- | Stake 3 × 100 mUSD → 3 smUSD positions.
+-- Batch deposit all 3 as collateral in one call.
+test_Lending_BatchDepositSMUSD_HappyPath : Script ()
+test_Lending_BatchDepositSMUSD_HappyPath = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  stakeSvcCid <- createStakingService operator regCid
+  lendSvcCid  <- createLendingService operator regCid
+
+  m1 <- mintMusd operator alice 100.0
+  m2 <- mintMusd operator alice 100.0
+  m3 <- mintMusd operator alice 100.0
+
+  (svc2, s1) <- submitMulti [alice] [operator] do
+    exerciseCmd stakeSvcCid Stake with user = alice; musdCid = m1
+  (svc3, s2) <- submitMulti [alice] [operator] do
+    exerciseCmd svc2 Stake with user = alice; musdCid = m2
+  (_svc4, s3) <- submitMulti [alice] [operator] do
+    exerciseCmd svc3 Stake with user = alice; musdCid = m3
+
+  -- Batch deposit all 3 smUSD as collateral
+  (_lendSvcCid2, escrowCid) <- submitMulti [alice] [operator] do
+    exerciseCmd lendSvcCid Lending_BatchDepositSMUSD with
+      user              = alice
+      smusdCids         = [s1, s2, s3]
+      existingEscrowCid = None
+      collateralAggCid  = None
+
+  -- Verify escrow: total shares = 300
+  escrow <- queryContractId operator escrowCid
+  let e = fromSome escrow
+  assertMsg "Escrow amount = 300 shares" (e.amount == 300.0)
+  assertMsg "Escrow owner is Alice"      (e.owner == alice)
+  assertMsg "Collateral type is smUSD"   (e.collateralType == CTN_SMUSD)
+
+  debug "✅ 3. Lending_BatchDepositSMUSD — happy path (3 positions, 300 shares)"
+
+-- ============================================================
+--  4. HAPPY PATH — Lending_BatchDepositSMUSDE
+-- ============================================================
+
+-- | Stake 2 × 150 mUSD → 2 smUSD-E positions (NoLock).
+-- Batch deposit both as collateral in one call.
+test_Lending_BatchDepositSMUSDE_HappyPath : Script ()
+test_Lending_BatchDepositSMUSDE_HappyPath = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  poolSvcCid <- createPoolService operator regCid
+  lendSvcCid <- createLendingService operator regCid
+
+  m1 <- mintMusd operator alice 150.0
+  m2 <- mintMusd operator alice 150.0
+
+  (poolSvcCid2, e1) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid ETHPool_Stake with
+      user = alice; musdCid = m1; selectedTier = NoLock
+  (_poolSvcCid3, e2) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid2 ETHPool_Stake with
+      user = alice; musdCid = m2; selectedTier = NoLock
+
+  -- Batch deposit both smUSD-E as collateral
+  (_lendSvcCid2, escrowCid) <- submitMulti [alice] [operator] do
+    exerciseCmd lendSvcCid Lending_BatchDepositSMUSDE with
+      user              = alice
+      smusdeCids        = [e1, e2]
+      existingEscrowCid = None
+      collateralAggCid  = None
+
+  escrow <- queryContractId operator escrowCid
+  let e = fromSome escrow
+  assertMsg "Escrow amount = 300 shares" (e.amount == 300.0)
+  assertMsg "Collateral type is smUSD-E" (e.collateralType == CTN_SMUSDE)
+
+  debug "✅ 4. Lending_BatchDepositSMUSDE — happy path (2 positions, 300 shares)"
+
+-- ============================================================
+--  5. INSUFFICIENT BALANCE — ETHPool_BatchUnstake
+-- ============================================================
+
+-- | Stake 1 × 100 mUSD → 1 smUSD-E position.
+-- Try to request 200 mUSD from it → INSUFFICIENT_BALANCE.
+test_ETHPool_BatchUnstake_InsufficientBalance : Script ()
+test_ETHPool_BatchUnstake_InsufficientBalance = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  poolSvcCid <- createPoolService operator regCid
+
+  m1 <- mintMusd operator alice 100.0
+  (poolSvcCid2, e1) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid ETHPool_Stake with
+      user = alice; musdCid = m1; selectedTier = NoLock
+
+  -- Try to unstake more than available → must fail
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd poolSvcCid2 ETHPool_BatchUnstake with
+      user          = alice
+      smusdeCids    = [e1]
+      requestedMusd = 200.0   -- Only 100 available
+
+  debug "✅ 5. ETHPool_BatchUnstake — INSUFFICIENT_BALANCE enforced"
+
+-- ============================================================
+--  6. INSUFFICIENT BALANCE — Unstake_Batch
+-- ============================================================
+
+test_Staking_UnstakeBatch_InsufficientBalance : Script ()
+test_Staking_UnstakeBatch_InsufficientBalance = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  stakeSvcCid <- createStakingService operator regCid
+
+  m1 <- mintMusd operator alice 100.0
+  (svc2, s1) <- submitMulti [alice] [operator] do
+    exerciseCmd stakeSvcCid Stake with user = alice; musdCid = m1
+
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd svc2 Unstake_Batch with
+      user          = alice
+      smusdCids     = [s1]
+      requestedMusd = 150.0   -- Only 100 pooled
+
+  debug "✅ 6. Unstake_Batch — INSUFFICIENT_BALANCE enforced"
+
+-- ============================================================
+--  7. MIXED OWNER — ETHPool_BatchUnstake
+-- ============================================================
+
+-- | Alice has 1 smUSD-E position, Bob has 1 smUSD-E position.
+-- Alice tries to include Bob's token in her batch → OWNER_MISMATCH.
+test_ETHPool_BatchUnstake_MixedOwner : Script ()
+test_ETHPool_BatchUnstake_MixedOwner = script do
+  (operator, alice, bob, regCid) <- setupParties
+  poolSvcCid <- createPoolService operator regCid
+
+  mA <- mintMusd operator alice 100.0
+  mB <- mintMusd operator bob   100.0
+
+  (poolSvcCid2, eAlice) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid ETHPool_Stake with
+      user = alice; musdCid = mA; selectedTier = NoLock
+  (poolSvcCid3, eBob) <- submitMulti [bob] [operator] do
+    exerciseCmd poolSvcCid2 ETHPool_Stake with
+      user = bob; musdCid = mB; selectedTier = NoLock
+
+  -- Alice tries to unstake both her token AND Bob's → must fail
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd poolSvcCid3 ETHPool_BatchUnstake with
+      user          = alice
+      smusdeCids    = [eAlice, eBob]   -- eBob is not owned by Alice
+      requestedMusd = 200.0
+
+  debug "✅ 7. ETHPool_BatchUnstake — OWNER_MISMATCH enforced"
+
+-- ============================================================
+--  8. MIXED OWNER — Lending_BatchDepositSMUSD
+-- ============================================================
+
+test_Lending_BatchDepositSMUSD_MixedOwner : Script ()
+test_Lending_BatchDepositSMUSD_MixedOwner = script do
+  (operator, alice, bob, regCid) <- setupParties
+  stakeSvcCid <- createStakingService operator regCid
+  lendSvcCid  <- createLendingService operator regCid
+
+  mA <- mintMusd operator alice 100.0
+  mB <- mintMusd operator bob   100.0
+
+  (svc2, sAlice) <- submitMulti [alice] [operator] do
+    exerciseCmd stakeSvcCid Stake with user = alice; musdCid = mA
+  (_svc3, sBob) <- submitMulti [bob] [operator] do
+    exerciseCmd svc2 Stake with user = bob; musdCid = mB
+
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd lendSvcCid Lending_BatchDepositSMUSD with
+      user              = alice
+      smusdCids         = [sAlice, sBob]   -- sBob not owned by Alice
+      existingEscrowCid = None
+      collateralAggCid  = None
+
+  debug "✅ 8. Lending_BatchDepositSMUSD — OWNER_MISMATCH enforced"
+
+-- ============================================================
+--  9. PAUSED SERVICE — ETHPool_BatchUnstake
+-- ============================================================
+
+test_ETHPool_BatchUnstake_Paused : Script ()
+test_ETHPool_BatchUnstake_Paused = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  poolSvcCid <- createPoolService operator regCid
+
+  m1 <- mintMusd operator alice 100.0
+  (poolSvcCid2, e1) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid ETHPool_Stake with
+      user = alice; musdCid = m1; selectedTier = NoLock
+
+  -- Pause the service
+  poolSvcCid3 <- submit operator do
+    exerciseCmd poolSvcCid2 ETHPool_SetPaused with newPaused = True
+
+  -- Batch unstake on paused service → must fail
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd poolSvcCid3 ETHPool_BatchUnstake with
+      user          = alice
+      smusdeCids    = [e1]
+      requestedMusd = 100.0
+
+  debug "✅ 9. ETHPool_BatchUnstake — SERVICE_PAUSED enforced"
+
+-- ============================================================
+-- 10. PAUSED SERVICE — Unstake_Batch
+-- ============================================================
+
+test_Staking_UnstakeBatch_Paused : Script ()
+test_Staking_UnstakeBatch_Paused = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  stakeSvcCid <- createStakingService operator regCid
+
+  m1 <- mintMusd operator alice 100.0
+  (svc2, s1) <- submitMulti [alice] [operator] do
+    exerciseCmd stakeSvcCid Stake with user = alice; musdCid = m1
+
+  svc3 <- submit operator do
+    exerciseCmd svc2 Staking_SetPaused with newPaused = True
+
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd svc3 Unstake_Batch with
+      user          = alice
+      smusdCids     = [s1]
+      requestedMusd = 100.0
+
+  debug "✅ 10. Unstake_Batch — SERVICE_PAUSED enforced"
+
+-- ============================================================
+-- 11. EMPTY LIST — ETHPool_BatchUnstake
+-- ============================================================
+
+test_ETHPool_BatchUnstake_EmptyList : Script ()
+test_ETHPool_BatchUnstake_EmptyList = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  poolSvcCid <- createPoolService operator regCid
+
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd poolSvcCid ETHPool_BatchUnstake with
+      user          = alice
+      smusdeCids    = []
+      requestedMusd = 100.0
+
+  debug "✅ 11. ETHPool_BatchUnstake — NO_POSITIONS_PROVIDED enforced"
+
+-- ============================================================
+-- 12. EMPTY LIST — Unstake_Batch
+-- ============================================================
+
+test_Staking_UnstakeBatch_EmptyList : Script ()
+test_Staking_UnstakeBatch_EmptyList = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  stakeSvcCid <- createStakingService operator regCid
+
+  submitMultiMustFail [alice] [operator] do
+    exerciseCmd stakeSvcCid Unstake_Batch with
+      user          = alice
+      smusdCids     = []
+      requestedMusd = 100.0
+
+  debug "✅ 12. Unstake_Batch — NO_POSITIONS_PROVIDED enforced"
+
+-- ============================================================
+-- 13. IDEMPOTENCY — Lending_BatchDepositSMUSD adds to existing escrow
+-- ============================================================
+
+-- | First deposit creates escrow, second deposit adds to same escrow via
+-- existingEscrowCid. Verifies cumulative shares are tracked correctly.
+test_Lending_BatchDepositSMUSD_Idempotency : Script ()
+test_Lending_BatchDepositSMUSD_Idempotency = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  stakeSvcCid <- createStakingService operator regCid
+  lendSvcCid  <- createLendingService operator regCid
+
+  -- First batch: 2 × 100
+  m1 <- mintMusd operator alice 100.0
+  m2 <- mintMusd operator alice 100.0
+  (svc2, s1) <- submitMulti [alice] [operator] do
+    exerciseCmd stakeSvcCid Stake with user = alice; musdCid = m1
+  (svc3, s2) <- submitMulti [alice] [operator] do
+    exerciseCmd svc2 Stake with user = alice; musdCid = m2
+
+  (_lendSvcCid2, escrowCid1) <- submitMulti [alice] [operator] do
+    exerciseCmd lendSvcCid Lending_BatchDepositSMUSD with
+      user              = alice
+      smusdCids         = [s1, s2]
+      existingEscrowCid = None
+      collateralAggCid  = None
+
+  escrow1 <- queryContractId operator escrowCid1
+  assertMsg "First batch: 200 shares" ((fromSome escrow1).amount == 200.0)
+
+  -- Second batch: 1 × 100, adding to existing escrow
+  m3 <- mintMusd operator alice 100.0
+  (_svc4, s3) <- submitMulti [alice] [operator] do
+    exerciseCmd svc3 Stake with user = alice; musdCid = m3
+
+  -- Note: Lending_BatchDepositSMUSD is nonconsuming, so lendSvcCid is still valid
+  (_lendSvcCid3, escrowCid2) <- submitMulti [alice] [operator] do
+    exerciseCmd lendSvcCid Lending_BatchDepositSMUSD with
+      user              = alice
+      smusdCids         = [s3]
+      existingEscrowCid = Some escrowCid1
+      collateralAggCid  = None
+
+  escrow2 <- queryContractId operator escrowCid2
+  assertMsg "Second batch: 300 shares total" ((fromSome escrow2).amount == 300.0)
+
+  debug "✅ 13. Lending_BatchDepositSMUSD — idempotency (cumulative deposits)"
+
+-- ============================================================
+-- 14. PARTIAL BATCH — ETHPool, requestedMusd < total value
+-- ============================================================
+
+-- | Provide 3 × 100 = 300 mUSD worth of tokens but only request 150.
+-- Verify 150 mUSD is returned and all 3 tokens are archived.
+test_ETHPool_BatchUnstake_PartialRequest : Script ()
+test_ETHPool_BatchUnstake_PartialRequest = script do
+  (operator, alice, _bob, regCid) <- setupParties
+  poolSvcCid <- createPoolService operator regCid
+
+  m1 <- mintMusd operator alice 100.0
+  m2 <- mintMusd operator alice 100.0
+  m3 <- mintMusd operator alice 100.0
+
+  (poolSvcCid2, e1) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid ETHPool_Stake with
+      user = alice; musdCid = m1; selectedTier = NoLock
+  (poolSvcCid3, e2) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid2 ETHPool_Stake with
+      user = alice; musdCid = m2; selectedTier = NoLock
+  (poolSvcCid4, e3) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid3 ETHPool_Stake with
+      user = alice; musdCid = m3; selectedTier = NoLock
+
+  -- Request only 150 mUSD from 300 worth of tokens
+  (poolSvcCid5, musdOut) <- submitMulti [alice] [operator] do
+    exerciseCmd poolSvcCid4 ETHPool_BatchUnstake with
+      user          = alice
+      smusdeCids    = [e1, e2, e3]
+      requestedMusd = 150.0
+
+  mOut <- queryContractId alice musdOut
+  assertMsg "Received exactly 150 mUSD" ((fromSome mOut).amount == 150.0)
+
+  -- All 3 tokens archived — original CIDs should be gone
+  check1 <- queryContractId alice e1
+  check2 <- queryContractId alice e2
+  check3 <- queryContractId alice e3
+  assertMsg "e1 archived" (not (isSome check1))
+  assertMsg "e2 archived" (not (isSome check2))
+  assertMsg "e3 archived" (not (isSome check3))
+
+  debug "✅ 14. ETHPool_BatchUnstake — partial request (150 of 300) accepted, all tokens archived"

@@ -1,0 +1,4 @@
+module V3ProtocolExtendedTest where
+
+-- Placeholder module to keep CI DAML parser/build green.
+-- Extended protocol tests are maintained in dedicated suites.

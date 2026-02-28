@@ -1,0 +1,497 @@
+-- | CantonBoostPool
+-- Canton-only Validator Reward Pool -- qualified by sMUSD stake.
+-- This module has no V3 equivalent; it is a Canton-native-only pool with no bridge integration.
+-- It references CantonSMUSD for eligibility qualification and CantonCoinToken for deposits.
+--
+-- Architecture:
+--   Users deposit Canton coin ONLY into this pool.
+--   Eligibility and deposit cap determined by their existing sMUSD position:
+--     maxCantonDeposit (in mUSD value) = sMUSD value × 0.25
+--   This enforces an effective 80/20 ratio without holding mUSD in this pool.
+--
+--   The user earns BOTH yields simultaneously:
+--     1. sMUSD yield — from TreasuryV2 strategies (via CantonStakingService)
+--     2. Validator rewards — from this pool (60% of Canton validator revenue)
+--
+-- Revenue Model:
+--   Validator rewards split 60/40 (LP / Protocol)
+--   Entry/exit fees (25-50 bps)
+--   Protocol accumulates Canton for governance weight
+--
+-- Lifecycle:
+--   Limited-time TVL driver. Sunset by pausing deposits,
+--   letting LPs withdraw Canton. sMUSD positions are completely unaffected.
+
+module CantonBoostPool where
+
+import DA.Time
+import CantonDirectMint (Money, Bps)
+import CantonSMUSD (CantonSMUSD(..))
+import CantonLending (EscrowedCollateral, CollateralType(..))
+import CantonCoinToken (CantonCoin(..), CantonCoin_Burn(..), CantonCoinTransferProposal(..))
+import UserPrivacySettings (lookupUserObservers, UserPrivacySettings)
+import Compliance (ComplianceRegistry(..), ValidateMint(..), ValidateRedemption(..), ValidateTransfer(..))
+import Governance (GovernanceActionLog(..), ActionType(..), ConsumeProof(..))
+
+-- ============================================================
+--                     SECTION 2: BOOST LP TOKEN
+-- ============================================================
+
+-- | Boost Pool LP token — represents a share of the Canton reward pool.
+-- Redeemable for Canton coin proportional to pool balance.
+template BoostPoolLP
+  with
+    issuer         : Party
+    owner          : Party
+    shares         : Money        -- LP share amount
+    depositedAt    : Time         -- For cooldown enforcement
+    complianceRegistryCid : ContractId ComplianceRegistry  -- HIGH-02: mandatory compliance
+    privacyObservers : [Party]    -- Opt-in transparency (from UserPrivacySettings)
+  where
+    signatory issuer, owner
+    observer privacyObservers
+    ensure shares > 0.0
+
+    -- | Update observers from user's privacy settings
+    -- DAML-H-02 FIX: User provides their settings CID explicitly (LF 2.x compatible)
+    choice BPLP_UpdateObservers : ContractId BoostPoolLP
+      with
+        settingsCid : Optional (ContractId UserPrivacySettings)
+      controller owner
+      do
+        newObservers <- lookupUserObservers issuer owner settingsCid
+        create this with privacyObservers = newObservers
+
+    choice BPLP_Transfer : ContractId BoostPoolLPTransferProposal
+      with newOwner : Party
+      controller owner
+      do
+        -- HIGH-02: Validate both sender and receiver against blacklist/freeze
+        exercise complianceRegistryCid ValidateTransfer
+          with sender = owner; receiver = newOwner
+        create BoostPoolLPTransferProposal with lp = this; newOwner
+
+    choice BPLP_Split : (ContractId BoostPoolLP, ContractId BoostPoolLP)
+      with splitShares : Money
+      controller owner
+      do
+        assertMsg "SPLIT_POSITIVE" (splitShares > 0.0)
+        assertMsg "SPLIT_LESS_THAN_TOTAL" (splitShares < shares)
+        c1 <- create this with shares = splitShares
+        c2 <- create this with shares = shares - splitShares
+        return (c1, c2)
+
+-- | Transfer proposal for BoostPoolLP (dual-signatory safe)
+template BoostPoolLPTransferProposal
+  with
+    lp       : BoostPoolLP
+    newOwner : Party
+  where
+    signatory lp.issuer, lp.owner
+    observer newOwner
+
+    choice BPLPTransferProposal_Accept : ContractId BoostPoolLP
+      controller newOwner
+      do create lp with owner = newOwner
+
+    choice BPLPTransferProposal_Reject : ContractId BoostPoolLP
+      controller newOwner
+      do create lp
+
+    choice BPLPTransferProposal_Cancel : ContractId BoostPoolLP
+      controller lp.owner
+      do create lp
+
+-- ============================================================
+--       SECTION 2B: BOOST POOL DEPOSIT RECORD
+-- ============================================================
+
+-- One record per user, updated on each deposit.
+template BoostPoolDepositRecord
+  with
+    operator              : Party
+    user                  : Party
+    cumulativeCantonValue : Money  -- Total Canton value (in mUSD) deposited so far
+  where
+    signatory operator
+    observer user
+
+    ensure cumulativeCantonValue >= 0.0
+
+    choice DepositRecord_Add : ContractId BoostPoolDepositRecord
+      with
+        additionalValue : Money
+      controller operator
+      do
+        create this with cumulativeCantonValue = cumulativeCantonValue + additionalValue
+
+    choice DepositRecord_Subtract : ContractId BoostPoolDepositRecord
+      with
+        subtractValue : Money
+      controller operator
+      do
+        let newValue = max 0.0 (cumulativeCantonValue - subtractValue)
+        create this with cumulativeCantonValue = newValue
+
+-- ============================================================
+--                     SECTION 3: CANTON BOOST POOL SERVICE
+-- ============================================================
+
+-- | Canton-only validator reward pool, qualified by sMUSD stake.
+--
+-- How it works:
+--   1. User must already hold CantonSMUSD (staked mUSD in the sMUSD pool)
+--   2. Max Canton deposit = sMUSD value (shares × globalSharePrice) × 0.25
+--      This enforces an effective 80/20 ratio by reference, not by holding mUSD
+--   3. User deposits Canton → receives BoostPoolLP shares
+--   4. Validator rewards distributed per-epoch: 60% to LPs, 40% to protocol
+--   5. User withdraws → receives Canton (proportional to LP shares)
+--   6. User's sMUSD position is completely independent and unaffected
+template CantonBoostPoolService
+  with
+    operator               : Party
+    -- Pool state
+    totalCantonDeposited   : Money      -- Total Canton in pool
+    totalLPShares          : Money      -- Total LP shares outstanding
+    -- Canton pricing (for cap calculation)
+    cantonPriceMusd        : Money      -- Canton coin price in mUSD terms
+    -- sMUSD reference (for reading user eligibility)
+    globalSharePrice       : Money      -- Synced from CantonStakingService for cap calc
+    -- Validator rewards tracking
+    totalValidatorRewards  : Money      -- Cumulative rewards earned
+    protocolRewardsAccrued : Money      -- 40% kept by protocol
+    lpRewardsDistributed   : Money      -- 60% distributed to LPs
+    lastRewardEpoch        : Int        -- Last reward distribution epoch
+    protocolFeesAccrued    : Money      -- Entry + exit fees accumulated
+    -- Pool parameters
+    entryFeeBps            : Bps        -- Entry fee (default 25 = 0.25%)
+    exitFeeBps             : Bps        -- Exit fee (default 50 = 0.50%)
+    lpRewardShareBps       : Bps        -- LP share of validator rewards (default 6000 = 60%)
+    cantonCapRatio         : Money      -- Max Canton value as ratio of sMUSD value (default 0.25 = 20/80)
+    cooldownSeconds        : Int        -- Minimum lock before withdrawal
+    paused                 : Bool
+    -- DAML-H-04: Mandatory compliance — all depositors must pass blacklist/freeze checks
+    complianceRegistryCid  : ContractId ComplianceRegistry
+    serviceName            : Text
+    observers              : [Party]
+  where
+    signatory operator
+    observer observers
+
+    ensure totalCantonDeposited >= 0.0
+        && totalLPShares >= 0.0
+        && cantonPriceMusd > 0.0
+        && globalSharePrice > 0.0
+        && protocolFeesAccrued >= 0.0
+        && entryFeeBps >= 0 && entryFeeBps <= 500
+        && exitFeeBps >= 0 && exitFeeBps <= 500
+        && lpRewardShareBps >= 0 && lpRewardShareBps <= 10000
+        && cantonCapRatio > 0.0 && cantonCapRatio <= 1.0
+
+    -- ──────────────────────────────────────────────
+    --  DEPOSIT: Canton only, qualified by sMUSD stake
+    -- ──────────────────────────────────────────────
+
+    -- | Deposit Canton into the boost pool.
+    choice Deposit : (ContractId CantonBoostPoolService, ContractId BoostPoolLP)
+      with
+        user       : Party
+        cantonCid  : ContractId CantonCoin      -- Canton being deposited
+        smusdCid   : ContractId CantonSMUSD
+      controller user
+      do
+        assertMsg "POOL_PAUSED" (not paused)
+
+        -- DAML-H-04: Mandatory compliance check — depositor must not be blacklisted
+        exercise complianceRegistryCid ValidateMint with minter = user
+
+        canton <- fetch cantonCid
+        assertMsg "CANTON_ISSUER_MISMATCH" (canton.issuer == operator)
+        assertMsg "CANTON_OWNER_MISMATCH" (canton.owner == user)
+
+        smusd <- fetch smusdCid
+        assertMsg "SMUSD_OWNER_MISMATCH" (smusd.owner == user)
+        assertMsg "SMUSD_ISSUER_MISMATCH" (smusd.issuer == operator)
+
+        -- FIX D-M04: Prevent sMUSD collateral escape — user cannot qualify for
+        -- BoostPool with sMUSD that is already escrowed as lending collateral
+        -- LF 2.x: Contract keys removed. Escrow check should be done by caller.
+        let smusdEscrowOpt : Optional (ContractId EscrowedCollateral) = None
+        assertMsg "SMUSD_ESCROWED_IN_LENDING" (smusdEscrowOpt == None)
+
+        -- SECURITY FIX DAML-H-06: Removed archive+recreate pattern. Previously the
+        -- sMUSD was archived and recreated with a new ContractId, breaking any external
+        -- references (e.g., from lending escrow or other contracts). The BoostPool only
+        -- needs to READ the sMUSD to verify ownership and calculate the deposit cap —
+        -- it does not need to consume the token. The sMUSD remains untouched.
+
+        -- Calculate deposit cap from sMUSD value
+        let smusdValueMusd = smusd.shares * globalSharePrice
+        let maxCantonValueMusd = smusdValueMusd * cantonCapRatio
+        let cantonValueMusd = canton.amount * cantonPriceMusd
+
+        let existingRecordOpt : Optional (ContractId BoostPoolDepositRecord) = None  -- LF 2.x: keys removed
+        previousDeposits <- case existingRecordOpt of
+          None -> return 0.0
+          Some recCid -> do
+            rec <- fetch recCid
+            return rec.cumulativeCantonValue
+
+        assertMsg "EXCEEDS_SMUSD_QUALIFIED_CAP" (previousDeposits + cantonValueMusd <= maxCantonValueMusd)
+
+        -- Update or create cumulative deposit record
+        case existingRecordOpt of
+          Some recCid -> do
+            exercise recCid DepositRecord_Add with additionalValue = cantonValueMusd
+            pure ()
+          None -> do
+            create BoostPoolDepositRecord with
+              operator
+              user
+              cumulativeCantonValue = cantonValueMusd
+            pure ()
+
+        now <- getTime
+
+        -- Apply entry fee
+        let feeAmount = canton.amount * intToNumeric entryFeeBps / 10000.0
+        let netCantonIn = canton.amount - feeAmount
+
+        -- Calculate LP shares: 1 share = 1 Canton at genesis, then proportional
+        let newShares = if totalLPShares == 0.0
+              then netCantonIn
+              else netCantonIn * totalLPShares / totalCantonDeposited
+
+        -- Lock Canton (burn from user, add to pool)
+        exercise cantonCid CantonCoin_Burn
+
+        -- Issue LP token
+        userObs <- lookupUserObservers operator user None
+        lpCid <- create BoostPoolLP with
+          issuer = operator
+          owner = user
+          shares = newShares
+          depositedAt = now
+          complianceRegistryCid = complianceRegistryCid
+          privacyObservers = userObs
+
+        newService <- create this with
+          totalCantonDeposited = totalCantonDeposited + netCantonIn
+          totalLPShares = totalLPShares + newShares
+          protocolFeesAccrued = protocolFeesAccrued + feeAmount
+
+        return (newService, lpCid)
+
+    -- ──────────────────────────────────────────────
+    --  WITHDRAW: LP shares → Canton
+    -- ──────────────────────────────────────────────
+
+    -- | Withdraw Canton from the pool by burning LP tokens.
+    choice Withdraw : (ContractId CantonBoostPoolService, ContractId CantonCoin)
+      with
+        user  : Party
+        lpCid : ContractId BoostPoolLP
+      controller user
+      do
+
+        -- DAML-H-04: Mandatory compliance check — withdrawer must not be blacklisted/frozen
+        exercise complianceRegistryCid ValidateRedemption with redeemer = user
+
+        lp <- fetch lpCid
+        assertMsg "LP_OWNER_MISMATCH" (lp.owner == user)
+
+        -- Enforce cooldown
+        now <- getTime
+        let cooldownRel = seconds cooldownSeconds
+        let elapsed = subTime now lp.depositedAt
+        assertMsg "COOLDOWN_NOT_ELAPSED" (elapsed >= cooldownRel)
+
+        assertMsg "POOL_EMPTY" (totalLPShares > 0.0)
+        -- Calculate proportional Canton out
+        let shareRatio = lp.shares / totalLPShares
+        let rawCantonOut = totalCantonDeposited * shareRatio
+
+        -- Apply exit fee
+        let feeAmount = rawCantonOut * intToNumeric exitFeeBps / 10000.0
+        let netCantonOut = rawCantonOut - feeAmount
+
+        -- Burn LP token
+        archive lpCid
+
+        -- Mint Canton back to user
+        userObs <- lookupUserObservers operator user None
+        cantonCid <- create CantonCoin with
+          issuer = operator
+          owner = user
+          amount = netCantonOut
+          privacyObservers = userObs
+
+        let withdrawnCantonValue = rawCantonOut * cantonPriceMusd
+        let existingRecordOpt : Optional (ContractId BoostPoolDepositRecord) = None  -- LF 2.x: keys removed
+        case existingRecordOpt of
+          Some recCid -> do
+            exercise recCid DepositRecord_Subtract with subtractValue = withdrawnCantonValue
+            pure ()
+          None -> pure ()
+
+        newService <- create this with
+          totalCantonDeposited = totalCantonDeposited - rawCantonOut
+          totalLPShares = totalLPShares - lp.shares
+          protocolFeesAccrued = protocolFeesAccrued + feeAmount
+
+        return (newService, cantonCid)
+
+    -- ──────────────────────────────────────────────
+    --  DISTRIBUTE VALIDATOR REWARDS
+    -- ──────────────────────────────────────────────
+
+    -- | Operator distributes Canton validator rewards to the pool.
+    -- Split: 60% added to pool balance (increases LP share value)
+    --        40% accrued to protocol (withdrawable separately)
+    choice DistributeRewards : ContractId CantonBoostPoolService
+      with
+        rewardAmount : Money
+        epochNumber  : Int
+      controller operator
+      do
+        assertMsg "EPOCH_SEQUENTIAL" (epochNumber > lastRewardEpoch)
+        assertMsg "EPOCH_GAP_TOO_LARGE" (epochNumber <= lastRewardEpoch + 100)
+        assertMsg "REWARD_POSITIVE" (rewardAmount > 0.0)
+
+        let lpShare = rewardAmount * intToNumeric lpRewardShareBps / 10000.0
+        let protocolShare = rewardAmount - lpShare
+
+        -- LP share goes into pool Canton balance (share price increases)
+        create this with
+          totalCantonDeposited = totalCantonDeposited + lpShare
+          totalValidatorRewards = totalValidatorRewards + rewardAmount
+          protocolRewardsAccrued = protocolRewardsAccrued + protocolShare
+          lpRewardsDistributed = lpRewardsDistributed + lpShare
+          lastRewardEpoch = epochNumber
+
+    -- ──────────────────────────────────────────────
+    --  SYNC PRICES (operator updates from external sources)
+    -- ──────────────────────────────────────────────
+
+    -- | Update Canton/mUSD price (from oracle or market data).
+    -- Used for deposit cap calculations.
+    choice SyncCantonPrice : ContractId CantonBoostPoolService
+      with
+        newPriceMusd : Money
+      controller operator
+      do
+        assertMsg "PRICE_POSITIVE" (newPriceMusd > 0.0)
+        -- Cap price change at 20% per update
+        let maxPrice = cantonPriceMusd * 1.2
+        let minPrice = cantonPriceMusd * 0.8
+        assertMsg "PRICE_CHANGE_TOO_LARGE" (newPriceMusd >= minPrice && newPriceMusd <= maxPrice)
+
+        create this with cantonPriceMusd = newPriceMusd
+
+    -- | Sync the global sMUSD share price (from CantonStakingService).
+    -- Keeps deposit cap calculation current as sMUSD yield accrues.
+    choice SyncSharePrice : ContractId CantonBoostPoolService
+      with
+        newGlobalSharePrice : Money
+      controller operator
+      do
+        assertMsg "SHARE_PRICE_POSITIVE" (newGlobalSharePrice > 0.0)
+        -- Cap at 10% decrease (same guard as CantonStakingService)
+        let minAllowed = globalSharePrice * 0.9
+        assertMsg "SHARE_PRICE_DECREASE_TOO_LARGE" (newGlobalSharePrice >= minAllowed)
+
+        create this with globalSharePrice = newGlobalSharePrice
+
+    -- ──────────────────────────────────────────────
+    --  PROTOCOL REWARD WITHDRAWAL
+    -- ──────────────────────────────────────────────
+
+    -- | Operator withdraws accumulated protocol Canton rewards (the 40% share).
+    choice WithdrawProtocolRewards : (ContractId CantonBoostPoolService, ContractId CantonCoin)
+      with
+        withdrawAmount : Money
+      controller operator
+      do
+        assertMsg "AMOUNT_POSITIVE" (withdrawAmount > 0.0)
+        assertMsg "INSUFFICIENT_PROTOCOL_REWARDS" (withdrawAmount <= protocolRewardsAccrued)
+
+        cantonCid <- create CantonCoin with
+          issuer = operator
+          owner = operator
+          amount = withdrawAmount
+          privacyObservers = []  -- Protocol wallet, fully private
+
+        newService <- create this with
+          protocolRewardsAccrued = protocolRewardsAccrued - withdrawAmount
+
+        return (newService, cantonCid)
+
+    -- | Operator withdraws accumulated protocol fees (entry + exit fees from C-B3 fix).
+    choice WithdrawProtocolFees : (ContractId CantonBoostPoolService, ContractId CantonCoin)
+      with
+        withdrawAmount : Money
+      controller operator
+      do
+        assertMsg "AMOUNT_POSITIVE" (withdrawAmount > 0.0)
+        assertMsg "INSUFFICIENT_PROTOCOL_FEES" (withdrawAmount <= protocolFeesAccrued)
+
+        cantonCid <- create CantonCoin with
+          issuer = operator
+          owner = operator
+          amount = withdrawAmount
+          privacyObservers = []  -- Protocol wallet, fully private
+
+        newService <- create this with
+          protocolFeesAccrued = protocolFeesAccrued - withdrawAmount
+
+        return (newService, cantonCid)
+
+    -- ──────────────────────────────────────────────
+    --  ADMIN
+    -- ──────────────────────────────────────────────
+
+    choice BoostPool_SetPaused : ContractId CantonBoostPoolService
+      with newPaused : Bool
+      controller operator
+      do
+        create this with paused = newPaused
+
+    -- DAML-M-05: Fee updates require governance co-signature (sensitive parameter)
+    choice BoostPool_UpdateFees : ContractId CantonBoostPoolService
+      with
+        newEntryFeeBps : Bps
+        newExitFeeBps  : Bps
+        governanceProofCid : ContractId GovernanceActionLog
+      controller operator
+      do
+        assertMsg "POOL_PAUSED" (not paused)
+        proof <- exercise governanceProofCid ConsumeProof with consumedBy = operator
+        assertMsg "WRONG_ACTION_TYPE" (proof.actionType == ParameterUpdate)
+        assertMsg "WRONG_TARGET_MODULE" (proof.targetModule == "CantonBoostPool")
+        assertMsg "ENTRY_FEE_VALID" (newEntryFeeBps >= 0 && newEntryFeeBps <= 500)
+        assertMsg "EXIT_FEE_VALID" (newExitFeeBps >= 0 && newExitFeeBps <= 500)
+        create this with
+          entryFeeBps = newEntryFeeBps
+          exitFeeBps = newExitFeeBps
+
+    -- DAML-M-05: Cap ratio updates require governance co-signature (sensitive parameter)
+    choice BoostPool_UpdateCapRatio : ContractId CantonBoostPoolService
+      with
+        newCapRatio : Money
+        governanceProofCid : ContractId GovernanceActionLog
+      controller operator
+      do
+        assertMsg "POOL_PAUSED" (not paused)
+        proof <- exercise governanceProofCid ConsumeProof with consumedBy = operator
+        assertMsg "WRONG_ACTION_TYPE" (proof.actionType == ParameterUpdate)
+        assertMsg "WRONG_TARGET_MODULE" (proof.targetModule == "CantonBoostPool")
+        assertMsg "CAP_RATIO_VALID" (newCapRatio > 0.0 && newCapRatio <= 1.0)
+        create this with cantonCapRatio = newCapRatio
+
+    -- DAML-M-05: Observer updates check paused state
+    choice BoostPool_UpdateObservers : ContractId CantonBoostPoolService
+      with newObservers : [Party]
+      controller operator
+      do
+        assertMsg "POOL_PAUSED" (not paused)
+        create this with observers = newObservers

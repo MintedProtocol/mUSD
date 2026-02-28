@@ -1,0 +1,377 @@
+-- | ComplianceExtendedTest
+-- Tests for Compliance module: blacklist, unblacklist, freeze, unfreeze,
+-- bulk blacklist, validate mint/transfer/redemption, IsCompliant.
+
+module ComplianceExtendedTest where
+
+import Compliance
+import DA.Set qualified as Set
+import DA.Time
+import DA.Date
+import Daml.Script
+
+-- ============================================================
+--                     HELPERS
+-- ============================================================
+
+createRegistry : Party -> Party -> Script (ContractId ComplianceRegistry)
+createRegistry regulator operator = do
+  now <- getTime
+  submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.empty; frozen = Set.empty; lastUpdated = now
+
+-- ============================================================
+--         TEST 1: BLACKLIST USER
+-- ============================================================
+
+test_BlacklistUser : Script ()
+test_BlacklistUser = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  reg <- createRegistry regulator operator
+
+  reg2 <- submit regulator do
+    exerciseCmd reg BlacklistUser with userToBlock = alice; reason = "OFAC"
+
+  r <- queryContractId regulator reg2
+  case r of
+    Some registry -> assertMsg "alice blacklisted" (Set.member alice registry.blacklisted)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 2: REMOVE FROM BLACKLIST
+-- ============================================================
+
+test_RemoveFromBlacklist : Script ()
+test_RemoveFromBlacklist = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  reg <- createRegistry regulator operator
+
+  reg2 <- submit regulator do
+    exerciseCmd reg BlacklistUser with userToBlock = alice; reason = "OFAC"
+  reg3 <- submit regulator do
+    exerciseCmd reg2 RemoveFromBlacklist with userToUnblock = alice; reason = "Cleared"
+
+  r <- queryContractId regulator reg3
+  case r of
+    Some registry -> assertMsg "alice unblacklisted" (not (Set.member alice registry.blacklisted))
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 3: FREEZE USER
+-- ============================================================
+
+test_FreezeUser : Script ()
+test_FreezeUser = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  reg <- createRegistry regulator operator
+
+  reg2 <- submit regulator do
+    exerciseCmd reg FreezeUser with userToFreeze = alice; reason = "Investigation"
+
+  r <- queryContractId regulator reg2
+  case r of
+    Some registry -> assertMsg "alice frozen" (Set.member alice registry.frozen)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 4: UNFREEZE USER
+-- ============================================================
+
+test_UnfreezeUser : Script ()
+test_UnfreezeUser = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  reg <- createRegistry regulator operator
+
+  reg2 <- submit regulator do
+    exerciseCmd reg FreezeUser with userToFreeze = alice; reason = "Investigation"
+  reg3 <- submit regulator do
+    exerciseCmd reg2 UnfreezeUser with userToUnfreeze = alice; reason = "Cleared"
+
+  r <- queryContractId regulator reg3
+  case r of
+    Some registry -> assertMsg "alice unfrozen" (not (Set.member alice registry.frozen))
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 5: VALIDATE MINT — BLACKLISTED REJECTED
+-- ============================================================
+
+test_ValidateMintBlacklisted : Script ()
+test_ValidateMintBlacklisted = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+
+  reg <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.fromList [alice]; frozen = Set.empty; lastUpdated = now
+
+  submitMustFail operator do
+    exerciseCmd reg ValidateMint with minter = alice
+  pure ()
+
+-- ============================================================
+--         TEST 6: VALIDATE MINT — CLEAN USER PASSES
+-- ============================================================
+
+test_ValidateMintClean : Script ()
+test_ValidateMintClean = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  reg <- createRegistry regulator operator
+
+  submit operator do exerciseCmd reg ValidateMint with minter = alice
+  pure ()
+
+-- ============================================================
+--         TEST 7: VALIDATE TRANSFER — SENDER BLACKLISTED
+-- ============================================================
+
+test_ValidateTransferSenderBlacklisted : Script ()
+test_ValidateTransferSenderBlacklisted = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  now <- getTime
+
+  reg <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.fromList [alice]; frozen = Set.empty; lastUpdated = now
+
+  submitMustFail operator do
+    exerciseCmd reg ValidateTransfer with sender = alice; receiver = bob
+  pure ()
+
+-- ============================================================
+--         TEST 8: VALIDATE TRANSFER — RECEIVER BLACKLISTED
+-- ============================================================
+
+test_ValidateTransferReceiverBlacklisted : Script ()
+test_ValidateTransferReceiverBlacklisted = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  now <- getTime
+
+  reg <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.fromList [bob]; frozen = Set.empty; lastUpdated = now
+
+  submitMustFail operator do
+    exerciseCmd reg ValidateTransfer with sender = alice; receiver = bob
+  pure ()
+
+-- ============================================================
+--         TEST 9: VALIDATE TRANSFER — SENDER FROZEN
+-- ============================================================
+
+test_ValidateTransferSenderFrozen : Script ()
+test_ValidateTransferSenderFrozen = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  now <- getTime
+
+  reg <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.empty; frozen = Set.fromList [alice]; lastUpdated = now
+
+  submitMustFail operator do
+    exerciseCmd reg ValidateTransfer with sender = alice; receiver = bob
+  pure ()
+
+-- ============================================================
+--         TEST 10: VALIDATE REDEMPTION — BLACKLISTED
+-- ============================================================
+
+test_ValidateRedemptionBlacklisted : Script ()
+test_ValidateRedemptionBlacklisted = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+
+  reg <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.fromList [alice]; frozen = Set.empty; lastUpdated = now
+
+  submitMustFail operator do
+    exerciseCmd reg ValidateRedemption with redeemer = alice
+  pure ()
+
+-- ============================================================
+--         TEST 11: VALIDATE REDEMPTION — FROZEN
+-- ============================================================
+
+test_ValidateRedemptionFrozen : Script ()
+test_ValidateRedemptionFrozen = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+
+  reg <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.empty; frozen = Set.fromList [alice]; lastUpdated = now
+
+  submitMustFail operator do
+    exerciseCmd reg ValidateRedemption with redeemer = alice
+  pure ()
+
+-- ============================================================
+--         TEST 12: IS COMPLIANT
+-- ============================================================
+
+test_IsCompliant : Script ()
+test_IsCompliant = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  now <- getTime
+
+  reg <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.fromList [bob]; frozen = Set.empty; lastUpdated = now
+
+  -- Use operator as caller since operator is an observer and can see the registry
+  aliceOk <- submit operator do exerciseCmd reg IsCompliant with party = alice; caller = operator
+  assertMsg "alice compliant" aliceOk
+
+  bobOk <- submit operator do exerciseCmd reg IsCompliant with party = bob; caller = operator
+  assertMsg "bob not compliant" (not bobOk)
+  pure ()
+
+-- ============================================================
+--         TEST 13: BULK BLACKLIST
+-- ============================================================
+
+test_BulkBlacklist : Script ()
+test_BulkBlacklist = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  reg <- createRegistry regulator operator
+
+  reg2 <- submit regulator do
+    exerciseCmd reg BulkBlacklist with
+      usersToBlock = [alice, bob, charlie]; reason = "Sanctions list"
+
+  r <- queryContractId regulator reg2
+  case r of
+    Some registry -> do
+      assertMsg "alice" (Set.member alice registry.blacklisted)
+      assertMsg "bob" (Set.member bob registry.blacklisted)
+      assertMsg "charlie" (Set.member charlie registry.blacklisted)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 14: BULK BLACKLIST — EMPTY LIST FAILS
+-- ============================================================
+
+test_BulkBlacklistEmptyFails : Script ()
+test_BulkBlacklistEmptyFails = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  reg <- createRegistry regulator operator
+
+  submitMustFail regulator do
+    exerciseCmd reg BulkBlacklist with usersToBlock = []; reason = "None"
+  pure ()
+
+-- ============================================================
+--         TEST 15: DOUBLE BLACKLIST FAILS
+-- ============================================================
+
+test_DoubleBlacklistFails : Script ()
+test_DoubleBlacklistFails = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  reg <- createRegistry regulator operator
+
+  reg2 <- submit regulator do
+    exerciseCmd reg BlacklistUser with userToBlock = alice; reason = "First"
+
+  submitMustFail regulator do
+    exerciseCmd reg2 BlacklistUser with userToBlock = alice; reason = "Again"
+  pure ()
+
+-- ============================================================
+--         TEST 16: UNBLACKLIST NOT-BLACKLISTED FAILS
+-- ============================================================
+
+test_UnblacklistNotBlacklistedFails : Script ()
+test_UnblacklistNotBlacklistedFails = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  reg <- createRegistry regulator operator
+
+  submitMustFail regulator do
+    exerciseCmd reg RemoveFromBlacklist with userToUnblock = alice; reason = "Not blocked"
+  pure ()
+
+-- ============================================================
+--         TEST 17: EMPTY REASON FAILS
+-- ============================================================
+
+test_EmptyReasonFails : Script ()
+test_EmptyReasonFails = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  reg <- createRegistry regulator operator
+
+  submitMustFail regulator do
+    exerciseCmd reg BlacklistUser with userToBlock = alice; reason = ""
+  pure ()
+
+-- ============================================================
+--         TEST 18: FROZEN CAN RECEIVE (MINT)
+-- ============================================================
+
+test_FrozenCanReceive : Script ()
+test_FrozenCanReceive = script do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+
+  reg <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.empty; frozen = Set.fromList [alice]; lastUpdated = now
+
+  -- Frozen can still receive (ValidateMint should pass for frozen)
+  submit operator do exerciseCmd reg ValidateMint with minter = alice
+  pure ()

@@ -1,0 +1,650 @@
+-- | CantonETHPool
+-- Canton-native ETH Pool — mUSD-first staking with Fluid strategy yield.
+--
+-- Architecture:
+--   Every deposit mints mUSD first, then the mUSD gathers in the pool
+--   (owned by operator). This makes the ETH pool a pure mUSD demand engine —
+--   every entry increases mUSD supply regardless of which asset the user starts with.
+--
+--   Accepted entry assets (all converted to mUSD via DirectMint):
+--   1. CantonMUSD  — direct stake (user already has mUSD)
+--   2. USDCx       — minted to mUSD via DirectMint_MintWithUSDCx, then auto-staked
+--   3. CantonUSDC  — minted to mUSD via DirectMint_Mint, then auto-staked
+--   4. CantonCoin  — sold to operator at oracle price, mUSD minted, then auto-staked
+--
+--   On unstake: user ALWAYS receives mUSD. If they want USDC back,
+--   they use DirectMint_Redeem separately — which burns mUSD.
+--   This creates the mUSD flywheel: enter = mint mUSD, exit = hold/burn mUSD.
+--
+-- Pool mechanics:
+--   Staked mUSD is NOT burned — it gathers in the pool owned by the operator.
+--   This backing is deployed to Fluid Protocol on Ethereum via the relay.
+--
+-- Yield:
+--   Fluid Protocol smart debt/collateral on Ethereum (T2/T4 vaults).
+--   Share price synced via bridge attestation.
+--
+-- Lending/Borrowing:
+--   CantonSMUSD_E can be deposited as collateral in CantonLending.
+
+module CantonETHPool where
+
+import DA.Time
+import DA.Text qualified as DA.Text
+import CantonDirectMint
+  ( CantonMUSD(..)
+  , CantonDirectMintService(..), DirectMint_Mint(..), DirectMint_MintWithUSDCx(..)
+  , CantonUSDC(..), USDCx(..)
+  , Money, Bps
+  )
+import CantonCoinToken (CantonCoin(..), CantonCoin_Burn(..))
+import Compliance (ComplianceRegistry(..), ValidateMint(..), ValidateRedemption(..), ValidateTransfer(..))
+import UserPrivacySettings (lookupUserObservers, UserPrivacySettings)
+
+-- ============================================================
+--                     SECTION 1: TIME-LOCK TIERS
+-- ============================================================
+
+-- | Time-lock tier for yield multiplier boost.
+-- Mirrors Solidity ETHPool.TimeLockTier enum.
+data TimeLockTier
+  = NoLock       -- No lock, 1.0x multiplier
+  | ShortLock    -- 30 days, 1.25x multiplier
+  | MediumLock   -- 90 days, 1.5x multiplier
+  | LongLock     -- 180 days, 2.0x multiplier
+  deriving (Eq, Show, Ord)
+
+-- | Get lock duration in seconds for a tier
+tierDurationSecs : TimeLockTier -> Int
+tierDurationSecs NoLock     = 0
+tierDurationSecs ShortLock  = 2592000    -- 30 days
+tierDurationSecs MediumLock = 7776000    -- 90 days
+tierDurationSecs LongLock   = 15552000   -- 180 days
+
+-- | Get yield multiplier in basis points for a tier
+tierMultiplierBps : TimeLockTier -> Bps
+tierMultiplierBps NoLock     = 10000   -- 1.0x
+tierMultiplierBps ShortLock  = 12500   -- 1.25x
+tierMultiplierBps MediumLock = 15000   -- 1.5x
+tierMultiplierBps LongLock   = 20000   -- 2.0x
+
+-- ============================================================
+--                     SECTION 2: smUSD-E TOKEN
+-- ============================================================
+
+-- | CantonSMUSD_E — Canton-native smUSD-E (ETH Pool variant).
+--
+-- Staking receipt. Every position was created by staking mUSD (which
+-- gathers in the pool). On unstake, user always receives mUSD at
+-- current share price.
+template CantonSMUSD_E
+  with
+    issuer : Party
+    owner : Party
+    shares : Money                -- Number of smUSD-E shares (boosted by multiplier)
+    entrySharePrice : Money       -- Share price when staked (for tracking PnL)
+    musdStaked : Money            -- mUSD amount that was staked
+    tier : TimeLockTier           -- Selected time-lock tier
+    stakedAt : Time               -- Timestamp when staked
+    unlockAt : Optional Time      -- When position unlocks (None = no lock)
+    privacyObservers : [Party]    -- Opt-in transparency (from UserPrivacySettings)
+  where
+    signatory issuer, owner
+    observer privacyObservers
+
+    ensure shares > 0.0
+
+    -- | Update observers from user privacy settings.
+    -- User provides their settings CID explicitly (LF 2.x compatible).
+    choice SMUSDE_UpdateObservers : ContractId CantonSMUSD_E
+      with
+        settingsCid : Optional (ContractId UserPrivacySettings)
+      controller owner
+      do
+        newObservers <- lookupUserObservers issuer owner settingsCid
+        create this with privacyObservers = newObservers
+
+    -- | Transfer smUSD-E (for lending/borrowing collateral use).
+    -- Freely transferable via propose-accept pattern.
+    -- Time-lock travels with the token.
+    choice SMUSDE_Transfer : ContractId CantonSMUSD_ETransferProposal
+      with
+        newOwner : Party
+        complianceRegistryCid : ContractId ComplianceRegistry
+      controller owner
+      do
+        exercise complianceRegistryCid ValidateTransfer with
+          sender = owner
+          receiver = newOwner
+        create CantonSMUSD_ETransferProposal with
+          smusde = this
+          newOwner
+          complianceRegistryCid
+
+    -- | Split shares (for partial collateral deposit or transfer)
+    choice SMUSDE_Split : (ContractId CantonSMUSD_E, ContractId CantonSMUSD_E)
+      with
+        splitShares : Money
+      controller owner
+      do
+        assertMsg "SPLIT_SHARES_POSITIVE" (splitShares > 0.0)
+        assertMsg "SPLIT_SHARES_LESS_THAN_TOTAL" (splitShares < shares)
+        let ratio = splitShares / shares
+        let splitMusd = musdStaked * ratio
+        c1 <- create this with
+          shares = splitShares
+          musdStaked = splitMusd
+        c2 <- create this with
+          shares = shares - splitShares
+          musdStaked = musdStaked - splitMusd
+        return (c1, c2)
+
+    -- | Merge two smUSD-E positions (must match tier and owner)
+    choice SMUSDE_Merge : ContractId CantonSMUSD_E
+      with
+        otherCid : ContractId CantonSMUSD_E
+      controller owner
+      do
+        other <- fetch otherCid
+        assertMsg "ISSUER_MISMATCH" (other.issuer == issuer)
+        assertMsg "OWNER_MISMATCH" (other.owner == owner)
+        assertMsg "TIER_MISMATCH" (other.tier == tier)
+        archive otherCid
+        let mergedUnlock = case (unlockAt, other.unlockAt) of
+              (Some t1, Some t2) -> Some (if t1 > t2 then t1 else t2)
+              (Some t1, None)    -> Some t1
+              (None, Some t2)    -> Some t2
+              (None, None)       -> None
+        create this with
+          shares = shares + other.shares
+          musdStaked = musdStaked + other.musdStaked
+          unlockAt = mergedUnlock
+
+-- | Transfer proposal for CantonSMUSD_E (dual-signatory safe).
+template CantonSMUSD_ETransferProposal
+  with
+    smusde : CantonSMUSD_E
+    newOwner : Party
+    complianceRegistryCid : ContractId ComplianceRegistry
+  where
+    signatory smusde.issuer, smusde.owner
+    observer newOwner
+
+    choice CantonSMUSD_ETransferProposal_Accept : ContractId CantonSMUSD_E
+      controller newOwner
+      do
+        exercise complianceRegistryCid ValidateMint with minter = newOwner
+        create smusde with owner = newOwner
+
+    choice CantonSMUSD_ETransferProposal_Reject : ContractId CantonSMUSD_E
+      controller newOwner
+      do create smusde
+
+    choice CantonSMUSD_ETransferProposal_Cancel : ContractId CantonSMUSD_E
+      controller smusde.owner
+      do create smusde
+
+-- ============================================================
+--                     SECTION 3: ETH POOL SERVICE
+-- ============================================================
+
+-- | CantonETHPoolService — mUSD-first ETH Pool staking on Canton.
+--
+-- Design principle: the pool is a pure mUSD staking pool.
+-- Non-mUSD assets are converted to mUSD via DirectMint before staking.
+-- Staked mUSD gathers in the pool (not burned) — it backs the smUSD-E shares.
+-- On exit, users always receive mUSD.
+--
+-- Yield source: Fluid Protocol smart debt/collateral on Ethereum.
+template CantonETHPoolService
+  with
+    operator : Party
+    governance : Party              -- Co-signer for critical ops
+    totalShares : Money             -- Total smUSD-E shares issued on Canton
+    totalMusdStaked : Money         -- Total mUSD gathered in pool
+    sharePrice : Money              -- Current smUSD-E share price (synced from Ethereum)
+    poolCap : Money                 -- Max mUSD stakeable
+    lastSyncEpoch : Int             -- Last synced epoch from Ethereum
+    paused : Bool
+    -- DirectMint integration for auto-conversion
+    directMintServiceCid : ContractId CantonDirectMintService
+    -- Canton coin oracle price (USD per Canton coin)
+    cantonCoinPrice : Money
+    -- Compliance + legal
+    complianceRegistryCid : ContractId ComplianceRegistry
+    mpaHash : Text                  -- SHA-256 of Master Participation Agreement
+    mpaUri : Text                   -- URI to MPA document
+    -- Supply cap tracking
+    musdMintCap : Money             -- Maximum total mUSD mintable through unstake
+    currentUnstakeMinted : Money    -- Running total of mUSD minted via unstake
+    observers : [Party]
+  where
+    signatory operator
+    observer observers
+
+    ensure totalShares >= 0.0
+        && sharePrice > 0.0
+        && poolCap > 0.0
+        && musdMintCap > 0.0
+        && currentUnstakeMinted >= 0.0
+        && cantonCoinPrice > 0.0
+        && DA.Text.length mpaHash == 64
+        && DA.Text.length mpaUri > 0
+
+    -- ──────────────────────────────────────────────────────
+    --  STAKE: mUSD → smUSD-E (direct)
+    -- ──────────────────────────────────────────────────────
+
+    -- | Stake mUSD directly. User already holds mUSD.
+    -- mUSD gathers in the pool (owned by operator, not burned).
+    choice ETHPool_Stake : (ContractId CantonETHPoolService, ContractId CantonSMUSD_E)
+      with
+        user : Party
+        musdCid : ContractId CantonMUSD
+        selectedTier : TimeLockTier
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+
+        exercise complianceRegistryCid ValidateMint with minter = user
+
+        musd <- fetch musdCid
+        assertMsg "ISSUER_MISMATCH" (musd.issuer == operator)
+        assertMsg "OWNER_MISMATCH" (musd.owner == user)
+        assertMsg "EXCEEDS_POOL_CAP" (totalMusdStaked + musd.amount <= poolCap)
+
+        let baseShares = musd.amount / sharePrice
+        let multiplier = tierMultiplierBps selectedTier
+        let boostedShares = baseShares * intToNumeric multiplier / 10000.0
+        assertMsg "ZERO_SHARES" (boostedShares > 0.0)
+
+        -- mUSD gathers in pool (archive user's token, operator holds the value)
+        archive musdCid
+
+        _mintSmUsdE this user musd.amount boostedShares selectedTier
+
+    -- ──────────────────────────────────────────────────────
+    --  STAKE: USDCx → mint mUSD → auto-stake smUSD-E
+    -- ──────────────────────────────────────────────────────
+
+    -- | Deposit USDCx, mint mUSD via DirectMint, auto-stake to smUSD-E.
+    -- The user gets smUSD-E in one step. mUSD is minted as intermediate
+    -- and gathers in the pool (not burned).
+    -- DirectMint handles fees, supply cap, compliance, and bridge-out.
+    choice ETHPool_StakeWithUSDCx : (ContractId CantonETHPoolService, ContractId CantonSMUSD_E)
+      with
+        user : Party
+        usdcxCid : ContractId USDCx
+        selectedTier : TimeLockTier
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+
+        -- Step 1: Mint mUSD via DirectMint (fees deducted, bridge-out emitted)
+        (newMintService, musdCid, _bridgeReq) <- exercise directMintServiceCid
+          DirectMint_MintWithUSDCx with user; usdcxCid
+
+        -- Step 2: Fetch the minted mUSD to get net amount (after DirectMint fees)
+        musd <- fetch musdCid
+        assertMsg "EXCEEDS_POOL_CAP" (totalMusdStaked + musd.amount <= poolCap)
+
+        let baseShares = musd.amount / sharePrice
+        let multiplier = tierMultiplierBps selectedTier
+        let boostedShares = baseShares * intToNumeric multiplier / 10000.0
+        assertMsg "ZERO_SHARES" (boostedShares > 0.0)
+
+        -- Step 3: mUSD gathers in pool (archive, operator holds the value)
+        archive musdCid
+
+        -- Step 4: Issue smUSD-E
+        (newPoolService, smusdeCid) <- _mintSmUsdE
+          (this with directMintServiceCid = newMintService)
+          user musd.amount boostedShares selectedTier
+
+        return (newPoolService, smusdeCid)
+
+    -- ──────────────────────────────────────────────────────
+    --  STAKE: CantonUSDC → mint mUSD → auto-stake smUSD-E
+    -- ──────────────────────────────────────────────────────
+
+    -- | Deposit USDC, mint mUSD via DirectMint, auto-stake to smUSD-E.
+    -- mUSD gathers in the pool (not burned).
+    choice ETHPool_StakeWithUSDC : (ContractId CantonETHPoolService, ContractId CantonSMUSD_E)
+      with
+        user : Party
+        usdcCid : ContractId CantonUSDC
+        selectedTier : TimeLockTier
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+
+        -- Step 1: Mint mUSD via DirectMint
+        (newMintService, musdCid, _bridgeReq) <- exercise directMintServiceCid
+          DirectMint_Mint with user; usdcCid
+
+        -- Step 2: Get net mUSD amount
+        musd <- fetch musdCid
+        assertMsg "EXCEEDS_POOL_CAP" (totalMusdStaked + musd.amount <= poolCap)
+
+        let baseShares = musd.amount / sharePrice
+        let multiplier = tierMultiplierBps selectedTier
+        let boostedShares = baseShares * intToNumeric multiplier / 10000.0
+        assertMsg "ZERO_SHARES" (boostedShares > 0.0)
+
+        -- Step 3: mUSD gathers in pool (archive, operator holds the value)
+        archive musdCid
+
+        (newPoolService, smusdeCid) <- _mintSmUsdE
+          (this with directMintServiceCid = newMintService)
+          user musd.amount boostedShares selectedTier
+
+        return (newPoolService, smusdeCid)
+
+    -- ──────────────────────────────────────────────────────
+    --  STAKE: CantonCoin → operator buys → mint mUSD → auto-stake
+    -- ──────────────────────────────────────────────────────
+
+    -- | Deposit Canton coin, operator buys at oracle price, mUSD minted
+    -- and auto-staked. Canton coin is burned (operator absorbs exposure).
+    -- mUSD gathers in the pool (not burned).
+    -- Operator sets cantonCoinPrice via governance-cosigned update.
+    choice ETHPool_StakeWithCantonCoin : (ContractId CantonETHPoolService, ContractId CantonSMUSD_E)
+      with
+        user : Party
+        coinCid : ContractId CantonCoin
+        selectedTier : TimeLockTier
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+
+        exercise complianceRegistryCid ValidateMint with minter = user
+
+        coin <- fetch coinCid
+        assertMsg "ISSUER_MISMATCH" (coin.issuer == operator)
+        assertMsg "OWNER_MISMATCH" (coin.owner == user)
+
+        -- Convert Canton coin to mUSD value at oracle price
+        let musdValue = coin.amount * cantonCoinPrice
+        assertMsg "ZERO_MUSD_VALUE" (musdValue > 0.0)
+        assertMsg "EXCEEDS_POOL_CAP" (totalMusdStaked + musdValue <= poolCap)
+
+        let baseShares = musdValue / sharePrice
+        let multiplier = tierMultiplierBps selectedTier
+        let boostedShares = baseShares * intToNumeric multiplier / 10000.0
+        assertMsg "ZERO_SHARES" (boostedShares > 0.0)
+
+        -- Burn Canton coin (operator absorbs the coin exposure)
+        exercise coinCid CantonCoin_Burn
+
+        -- Mint mUSD directly (operator is issuer, no DirectMint fees for coin conversion)
+        -- mUSD gathers in pool (owned by operator)
+        userObs <- lookupUserObservers operator user None
+        musdCid <- create CantonMUSD with
+          issuer = operator
+          owner = operator  -- Operator holds in pool
+          amount = musdValue
+          agreementHash = mpaHash
+          agreementUri = mpaUri
+          privacyObservers = userObs
+
+        -- mUSD stays in pool (not burned) — operator is signatory
+        -- The pool's totalMusdStaked counter tracks the backing
+
+        _mintSmUsdE this user musdValue boostedShares selectedTier
+
+    -- ──────────────────────────────────────────────────────
+    --  UNSTAKE: smUSD-E → mUSD (always)
+    -- ──────────────────────────────────────────────────────
+
+    -- | Unstake: burn smUSD-E, receive mUSD at current share price.
+    -- Always returns mUSD. If user wants USDC, they use DirectMint_Redeem
+    -- separately — which burns mUSD (good for protocol).
+    choice ETHPool_Unstake : (ContractId CantonETHPoolService, ContractId CantonMUSD)
+      with
+        user : Party
+        smusdeCid : ContractId CantonSMUSD_E
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+
+        exercise complianceRegistryCid ValidateRedemption with redeemer = user
+
+        smusde <- fetch smusdeCid
+        assertMsg "OWNER_MISMATCH" (smusde.owner == user)
+
+        -- Check time-lock expired
+        now <- getTime
+        case smusde.unlockAt of
+          Some unlockTime -> assertMsg "POSITION_LOCKED" (now >= unlockTime)
+          None -> pure ()
+
+        -- mUSD at current share price (yield captured here)
+        let musdAmount = smusde.shares * sharePrice
+
+        assertMsg "UNSTAKE_EXCEEDS_MUSD_MINT_CAP" (currentUnstakeMinted + musdAmount <= musdMintCap)
+
+        -- Burn smUSD-E
+        archive smusdeCid
+
+        -- Mint mUSD to user
+        userObs <- lookupUserObservers operator user None
+        musdCid <- create CantonMUSD with
+          issuer = operator
+          owner = user
+          amount = musdAmount
+          agreementHash = mpaHash
+          agreementUri = mpaUri
+          privacyObservers = userObs
+
+        newService <- create this with
+          totalShares = totalShares - smusde.shares
+          totalMusdStaked = if totalMusdStaked >= smusde.musdStaked
+                           then totalMusdStaked - smusde.musdStaked
+                           else 0.0
+          currentUnstakeMinted = currentUnstakeMinted + musdAmount
+
+        return (newService, musdCid)
+
+    -- ──────────────────────────────────────────────────────
+    --  BATCH UNSTAKE: multiple smUSD-E positions → single mUSD
+    -- ──────────────────────────────────────────────────────
+
+    -- | ETHPool_BatchUnstake — Option 2 batch extension.
+    --
+    -- Allows a user with fragmented smUSD-E positions to unstake up to
+    -- `requestedMusd` worth of mUSD in a single atomic transaction by
+    -- providing multiple smUSD-E contract IDs.
+    --
+    -- All existing single-position invariants are enforced per token:
+    --   - Ownership check: every token must belong to `user`
+    --   - Issuer check: every token must be issued by `operator`
+    --   - Time-lock check: every position must be unlocked
+    --
+    -- Additional batch invariants:
+    --   - At least one smusdeCid must be provided
+    --   - Total mUSD value across all positions >= requestedMusd
+    --   - requestedMusd > 0
+    --   - currentUnstakeMinted + requestedMusd <= musdMintCap
+    --
+    -- On success:
+    --   - All provided smUSD-E tokens are archived
+    --   - Exactly `requestedMusd` mUSD is created for the user
+    --   - Service totalShares / totalMusdStaked / currentUnstakeMinted updated
+    --
+    -- FORFEIT POLICY (intentional, by design):
+    --   ALL provided smUSD-E tokens are archived unconditionally, even if
+    --   their combined value exceeds `requestedMusd`.  The caller receives
+    --   exactly `requestedMusd` mUSD; the excess yield is burned.
+    --   This is a deliberate protocol-level policy chosen for simplicity and
+    --   atomicity — returning change would require re-minting smUSD-E tokens
+    --   with new lock periods, adding compliance and tier-mismatch complexity.
+    --   Callers MUST ensure they pass the minimal covering set of tokens.
+    --   Use SMUSDE_Split to pre-split positions, or use the frontend helper
+    --   `selectTokensForAmount` in canton-balances.ts which selects the
+    --   smallest covering set automatically.
+    choice ETHPool_BatchUnstake : (ContractId CantonETHPoolService, ContractId CantonMUSD)
+      with
+        user          : Party
+        smusdeCids    : [ContractId CantonSMUSD_E]  -- One or more smUSD-E positions
+        requestedMusd : Money                        -- Exact mUSD amount user wants
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        assertMsg "NO_POSITIONS_PROVIDED" (not (null smusdeCids))
+        assertMsg "REQUESTED_AMOUNT_POSITIVE" (requestedMusd > 0.0)
+
+        exercise complianceRegistryCid ValidateRedemption with redeemer = user
+
+        now <- getTime
+
+        -- Validate each position: ownership, issuer, time-lock
+        let validatePos cid = do
+              smusde <- fetch cid
+              assertMsg "OWNER_MISMATCH" (smusde.owner == user)
+              assertMsg "ISSUER_MISMATCH" (smusde.issuer == operator)
+              case smusde.unlockAt of
+                Some unlockTime -> assertMsg "POSITION_LOCKED" (now >= unlockTime)
+                None -> pure ()
+              return (smusde.shares, smusde.musdStaked)
+
+        positionData <- mapA validatePos smusdeCids
+
+        -- Total mUSD value at current share price
+        let totalSharesProvided = foldl (\acc (sh, _) -> acc + sh) 0.0 positionData
+        let totalMusdValue      = totalSharesProvided * sharePrice
+        let totalMusdStakedSum  = foldl (\acc (_, ms) -> acc + ms) 0.0 positionData
+
+        assertMsg "INSUFFICIENT_BALANCE" (totalMusdValue >= requestedMusd)
+        assertMsg "UNSTAKE_EXCEEDS_MUSD_MINT_CAP"
+          (currentUnstakeMinted + requestedMusd <= musdMintCap)
+
+        -- Archive all provided smUSD-E positions
+        _ <- mapA archive smusdeCids
+
+        -- Mint exactly requestedMusd to user
+        userObs <- lookupUserObservers operator user None
+        musdCid <- create CantonMUSD with
+          issuer      = operator
+          owner       = user
+          amount      = requestedMusd
+          agreementHash = mpaHash
+          agreementUri  = mpaUri
+          privacyObservers = userObs
+
+        -- Proportional shares consumed = requestedMusd / sharePrice
+        let sharesConsumed = requestedMusd / sharePrice
+
+        newService <- create this with
+          totalShares          = totalShares - totalSharesProvided
+          totalMusdStaked      = if totalMusdStaked >= totalMusdStakedSum
+                                 then totalMusdStaked - totalMusdStakedSum
+                                 else 0.0
+          currentUnstakeMinted = currentUnstakeMinted + requestedMusd
+
+        return (newService, musdCid)
+
+    -- ──────────────────────────────────────────────────────
+    --  SHARE PRICE SYNC (from Fluid strategy on Ethereum)
+    -- ──────────────────────────────────────────────────────
+
+    choice ETHPool_SyncSharePrice : ContractId CantonETHPoolService
+      with
+        newSharePrice : Money
+        epochNumber : Int
+        attestationHash : Text
+        validatorCount : Int
+      controller operator, governance
+      do
+        assertMsg "EPOCH_NOT_SEQUENTIAL" (epochNumber > lastSyncEpoch)
+        assertMsg "SHARE_PRICE_POSITIVE" (newSharePrice > 0.0)
+        assertMsg "ATTESTATION_REQUIRED" (attestationHash /= "")
+        assertMsg "INSUFFICIENT_VALIDATORS" (validatorCount >= 3)
+        let maxPrice = sharePrice * 1.1
+        let minPrice = sharePrice * 0.9
+        assertMsg "PRICE_INCREASE_TOO_LARGE" (newSharePrice <= maxPrice)
+        assertMsg "PRICE_DECREASE_TOO_LARGE" (newSharePrice >= minPrice)
+        create this with
+          sharePrice = newSharePrice
+          lastSyncEpoch = epochNumber
+
+    -- ──────────────────────────────────────────────────────
+    --  ADMIN
+    -- ──────────────────────────────────────────────────────
+
+    choice ETHPool_SetCantonCoinPrice : ContractId CantonETHPoolService
+      with
+        newPrice : Money
+      controller operator, governance
+      do
+        assertMsg "PRICE_POSITIVE" (newPrice > 0.0)
+        let maxPrice = cantonCoinPrice * 1.25
+        let minPrice = cantonCoinPrice * 0.75
+        assertMsg "CANTON_COIN_PRICE_CHANGE_TOO_LARGE" (newPrice <= maxPrice && newPrice >= minPrice)
+        create this with cantonCoinPrice = newPrice
+
+    choice ETHPool_SetPoolCap : ContractId CantonETHPoolService
+      with
+        newCap : Money
+      controller operator, governance
+      do
+        assertMsg "CAP_POSITIVE" (newCap > 0.0)
+        create this with poolCap = newCap
+
+    choice ETHPool_SetMintCap : ContractId CantonETHPoolService
+      with
+        newMintCap : Money
+      controller operator, governance
+      do
+        assertMsg "MINT_CAP_POSITIVE" (newMintCap > 0.0)
+        create this with musdMintCap = newMintCap
+
+    choice ETHPool_SetPaused : ContractId CantonETHPoolService
+      with
+        newPaused : Bool
+      controller operator
+      do create this with paused = newPaused
+
+    choice ETHPool_SetComplianceRegistry : ContractId CantonETHPoolService
+      with
+        newRegistryCid : ContractId ComplianceRegistry
+      controller operator, governance
+      do create this with complianceRegistryCid = newRegistryCid
+
+    choice ETHPool_SetDirectMintService : ContractId CantonETHPoolService
+      with
+        newServiceCid : ContractId CantonDirectMintService
+      controller operator, governance
+      do create this with directMintServiceCid = newServiceCid
+
+
+-- ============================================================
+--                     INTERNAL HELPER
+-- ============================================================
+
+-- | Mint smUSD-E and update pool state. Used by all stake choices.
+_mintSmUsdE : CantonETHPoolService -> Party -> Money -> Money -> TimeLockTier
+            -> Update (ContractId CantonETHPoolService, ContractId CantonSMUSD_E)
+_mintSmUsdE service user musdValue boostedShares selectedTier = do
+  now <- getTime
+  let lockDuration = tierDurationSecs selectedTier
+  let unlock = if lockDuration > 0
+               then Some (addRelTime now (seconds lockDuration))
+               else None
+
+  userObs <- lookupUserObservers service.operator user None
+  smusdeCid <- create CantonSMUSD_E with
+    issuer = service.operator
+    owner = user
+    shares = boostedShares
+    entrySharePrice = service.sharePrice
+    musdStaked = musdValue
+    tier = selectedTier
+    stakedAt = now
+    unlockAt = unlock
+    privacyObservers = userObs
+
+  newService <- create service with
+    totalShares = service.totalShares + boostedShares
+    totalMusdStaked = service.totalMusdStaked + musdValue
+
+  return (newService, smusdeCid)

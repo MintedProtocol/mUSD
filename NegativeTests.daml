@@ -1,0 +1,554 @@
+-- | NegativeTests.daml - Adversarial Test Suite
+--
+-- This module contains Daml Scripts that prove the system correctly
+-- REJECTS unauthorized or invalid operations. Auditors require negative
+-- test coverage to verify security properties.
+--
+-- Test categories:
+--   1. Authorization failures (unauthorized mint, transfer, burn)
+--   2. Compliance failures (blacklisted/frozen party operations)
+--   3. State validation failures (double-spend, invalid amounts)
+--   4. Governance failures (insufficient approvals, expired proposals)
+--   5. Upgrade failures (unauthorized migration, closed windows)
+
+module NegativeTests where
+
+import DA.Time
+import DA.Set qualified as Set
+import DA.Optional (isSome)
+import DA.Text qualified as T
+import Daml.Script
+
+-- Import modules under test
+import Minted.Protocol.V3
+import Compliance
+import Governance qualified as Gov
+import Upgrade
+
+-- ============================================================
+--                     CONSTANTS
+-- ============================================================
+
+-- | 64-character hex string for agreement/payload hashes
+hash64 : Text
+hash64 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+-- ============================================================
+--                     1. AUTHORIZATION TESTS
+-- ============================================================
+
+-- | Test: Unauthorized party cannot mint mUSD
+test_UnauthorizedMint : Script ()
+test_UnauthorizedMint = do
+  -- Setup
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  attacker <- allocateParty "Attacker"
+  
+  -- Create supply service
+  supplyServiceCid <- submitMulti [operator, governance] [] do
+    createCmd MUSDSupplyService with
+      operator
+      governance
+      supplyCap = 1000000.0
+      currentSupply = 0.0
+      largeMintThreshold = 100000.0
+      pendingLargeMints = []
+      observers = []
+
+  -- Attacker tries to mint via SupplyService_VaultMint
+  -- This should fail because attacker is not the operator
+  submitMultiMustFail [attacker] [operator] do
+    exerciseCmd supplyServiceCid SupplyService_VaultMint with
+      borrower = attacker
+      borrowAmount = 1000.0
+      agreementHash = hash64
+      agreementUri = "https://example.com/agreement"
+
+  return ()
+
+-- | Test: Non-governance party cannot approve large mint
+test_UnauthorizedLargeMintApproval : Script ()
+test_UnauthorizedLargeMintApproval = do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  attacker <- allocateParty "Attacker"
+  
+  supplyServiceCid <- submitMulti [operator, governance] [] do
+    createCmd MUSDSupplyService with
+      operator
+      governance
+      supplyCap = 1000000.0
+      currentSupply = 0.0
+      largeMintThreshold = 100000.0
+      pendingLargeMints = []
+      observers = []
+
+  -- Attacker tries to approve a large mint for themselves
+  submitMultiMustFail [attacker] [operator] do
+    exerciseCmd supplyServiceCid SupplyService_ApproveLargeMint with
+      borrower = attacker
+      maxAmount = 500000.0
+
+  return ()
+
+-- | Test: Cannot transfer mUSD without owner consent
+test_UnauthorizedTransfer : Script ()
+test_UnauthorizedTransfer = do
+  operator <- allocateParty "Operator"
+  owner <- allocateParty "Owner"
+  attacker <- allocateParty "Attacker"
+
+  -- Create mUSD held by owner
+  musdCid <- submitMulti [operator, owner] [] do
+    createCmd MintedMUSD with
+      issuer = operator
+      owner = owner
+      amount = 1000.0
+      blacklisted = False
+      agreementHash = hash64
+      agreementUri = "https://example.com"
+      observers = []
+
+  -- Attacker tries to initiate transfer (not the owner)
+  -- Note: MUSD_Transfer requires complianceRegistryCid but test expects auth failure
+  -- Create a compliance registry for the transfer call
+  regulator <- allocateParty "Regulator"
+  now <- getTime
+  complianceCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.empty
+      frozen = Set.empty
+      lastUpdated = now
+  submitMultiMustFail [attacker] [operator] do
+    exerciseCmd musdCid MUSD_Transfer with
+      newOwner = attacker
+      complianceRegistryCid = complianceCid
+
+  return ()
+
+-- ============================================================
+--                     2. COMPLIANCE TESTS
+-- ============================================================
+
+-- | Test: Blacklisted party cannot transfer
+test_BlacklistedCannotTransfer : Script ()
+test_BlacklistedCannotTransfer = do
+  operator <- allocateParty "Operator"
+  owner <- allocateParty "Owner"
+  receiver <- allocateParty "Receiver"
+
+  -- Create BLACKLISTED mUSD
+  musdCid <- submitMulti [operator, owner] [] do
+    createCmd MintedMUSD with
+      issuer = operator
+      owner = owner
+      amount = 1000.0
+      blacklisted = True  -- BLACKLISTED
+      agreementHash = hash64
+      agreementUri = "https://example.com"
+      observers = []
+
+  -- Owner tries to transfer blacklisted token
+  regulator <- allocateParty "Regulator"
+  now <- getTime
+  complianceCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.empty
+      frozen = Set.empty
+      lastUpdated = now
+  submitMustFail owner do
+    exerciseCmd musdCid MUSD_Transfer with
+      newOwner = receiver
+      complianceRegistryCid = complianceCid
+
+  return ()
+
+-- | Test: Frozen party in compliance registry cannot transfer
+test_FrozenPartyCannotOperate : Script ()
+test_FrozenPartyCannotOperate = do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  frozenUser <- allocateParty "FrozenUser"
+  
+  now <- getTime
+
+  -- Create compliance registry with frozen user
+  registryCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.empty
+      frozen = Set.singleton frozenUser
+      lastUpdated = now
+
+  -- Try to validate a transfer from frozen user (should fail)
+  submitMustFail regulator do
+    exerciseCmd registryCid ValidateTransfer with
+      sender = frozenUser
+      receiver = operator
+
+  return ()
+
+-- | Test: ValidateMint fails explicitly for blacklisted minter.
+-- This isolates the blacklist guard path so the failure reason is unambiguous.
+test_BlacklistedMinterCannotValidateMint : Script ()
+test_BlacklistedMinterCannotValidateMint = do
+  regulator <- allocateParty "Regulator"
+  operator <- allocateParty "Operator"
+  badMinter <- allocateParty "BadMinter"
+  now <- getTime
+
+  registryCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.singleton badMinter
+      frozen = Set.empty
+      lastUpdated = now
+
+  submitMustFail operator do
+    exerciseCmd registryCid ValidateMint with
+      minter = badMinter
+
+  return ()
+
+-- ============================================================
+--                     3. STATE VALIDATION TESTS
+-- ============================================================
+
+-- | Test: Cannot create mUSD with zero or negative amount
+test_InvalidAmountRejected : Script ()
+test_InvalidAmountRejected = do
+  operator <- allocateParty "Operator"
+  owner <- allocateParty "Owner"
+
+  -- Try to create mUSD with zero amount (should fail ensure clause)
+  submitMultiMustFail [operator, owner] [] do
+    createCmd MintedMUSD with
+      issuer = operator
+      owner = owner
+      amount = 0.0  -- INVALID: must be > 0
+      blacklisted = False
+      agreementHash = hash64
+      agreementUri = "https://example.com"
+      observers = []
+
+  return ()
+
+-- | Test: Cannot split more than total amount
+test_InvalidSplitRejected : Script ()
+test_InvalidSplitRejected = do
+  operator <- allocateParty "Operator"
+  owner <- allocateParty "Owner"
+
+  musdCid <- submitMulti [operator, owner] [] do
+    createCmd MintedMUSD with
+      issuer = operator
+      owner = owner
+      amount = 100.0
+      blacklisted = False
+      agreementHash = hash64
+      agreementUri = "https://example.com"
+      observers = []
+
+  -- Try to split more than available
+  submitMustFail owner do
+    exerciseCmd musdCid MUSD_Split with
+      splitAmount = 150.0  -- INVALID: more than 100.0
+      operator = operator
+
+  return ()
+
+-- | Test: Cannot exceed supply cap
+test_SupplyCapEnforced : Script ()
+test_SupplyCapEnforced = do
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  borrower <- allocateParty "Borrower"
+
+  supplyServiceCid <- submitMulti [operator, governance] [] do
+    createCmd MUSDSupplyService with
+      operator
+      governance
+      supplyCap = 1000.0  -- Low cap for testing
+      currentSupply = 900.0  -- Already near cap
+      largeMintThreshold = 100000.0
+      pendingLargeMints = []
+      observers = []
+
+  -- Try to mint more than remaining cap allows
+  submitMustFail operator do
+    exerciseCmd supplyServiceCid SupplyService_VaultMint with
+      borrower
+      borrowAmount = 200.0  -- INVALID: would exceed 1000.0 cap
+      agreementHash = hash64
+      agreementUri = "https://example.com"
+
+  return ()
+
+-- ============================================================
+--                     4. GOVERNANCE TESTS
+-- ============================================================
+
+-- | Test: Proposal cannot be executed without sufficient approvals
+test_InsufficientApprovalsRejected : Script ()
+test_InsufficientApprovalsRejected = do
+  operator <- allocateParty "Operator"
+  gov1 <- allocateParty "Governor1"
+  gov2 <- allocateParty "Governor2"
+  gov3 <- allocateParty "Governor3"
+  
+  now <- getTime
+
+  -- Create proposal requiring 2-of-3 approval
+  proposalCid <- submitMulti [operator, gov1] [] do
+    createCmd Gov.MultiSigProposal with
+      proposalId = "PROP-001"
+      operator
+      proposer = gov1
+      governors = [gov1, gov2, gov3]
+      actionType = Gov.ParameterUpdate
+      targetModule = "NegativeTest"
+      description = "Update fee to 1%"
+      payload = "{\"newFee\": 100}"
+      payloadHash = hash64
+      requiredApprovals = 2
+      approvals = Set.empty
+      rejections = Set.empty
+      proposedAt = now
+      expiresAt = addRelTime now (days 7)
+      timelockEndsAt = None
+      timelockDuration = hours 24
+      status = Gov.Pending
+      observers = []
+
+  -- Only 1 approval (gov1)
+  proposalCid' <- submit gov1 do
+    exerciseCmd proposalCid Gov.Proposal_Approve with
+      approver = gov1
+
+  -- Try to execute with only 1 approval (needs 2)
+  submitMustFail operator do
+    exerciseCmd proposalCid' Gov.Proposal_Execute with
+      executor = operator
+
+  return ()
+
+-- | Test: Non-governor cannot approve proposal
+test_NonGovernorCannotApprove : Script ()
+test_NonGovernorCannotApprove = do
+  operator <- allocateParty "Operator"
+  gov1 <- allocateParty "Governor1"
+  attacker <- allocateParty "Attacker"
+  
+  now <- getTime
+
+  proposalCid <- submitMulti [operator, gov1] [] do
+    createCmd Gov.MultiSigProposal with
+      proposalId = "PROP-003"
+      operator
+      proposer = gov1
+      governors = [gov1]  -- Only gov1 is a governor
+      actionType = Gov.ParameterUpdate
+      targetModule = "NegativeTest"
+      description = "Test proposal"
+      payload = "{}"
+      payloadHash = hash64
+      requiredApprovals = 1
+      approvals = Set.empty
+      rejections = Set.empty
+      proposedAt = now
+      expiresAt = addRelTime now (days 7)
+      timelockEndsAt = None
+      timelockDuration = hours 24
+      status = Gov.Pending
+      observers = []
+
+  -- Attacker (not a governor) tries to approve
+  submitMultiMustFail [attacker] [operator] do
+    exerciseCmd proposalCid Gov.Proposal_Approve with
+      approver = attacker
+
+  return ()
+
+-- ============================================================
+--                     5. UPGRADE TESTS
+-- ============================================================
+
+-- | Test: Non-governance cannot approve upgrade
+test_UnauthorizedUpgradeApproval : Script ()
+test_UnauthorizedUpgradeApproval = do
+  operator <- allocateParty "Operator"
+  gov1 <- allocateParty "Governor1"
+  gov2 <- allocateParty "Governor2"
+  attacker <- allocateParty "Attacker"
+  
+  now <- getTime
+
+  proposalCid <- submit operator do
+    createCmd UpgradeProposal with
+      operator
+      governance = [gov1, gov2]
+      approvalThreshold = 2
+      approvals = Set.empty
+      sourceVersion = "V2"
+      targetVersion = "V3"
+      migrationScriptHash = hash64
+      changelogUri = "https://example.com/v3"
+      proposedAt = now
+      activationDelay = days 1
+      migrationWindowDays = 30
+      rollbackWindowDays = 7
+      status = Proposed
+
+  -- Attacker (not in governance) tries to approve
+  submitMultiMustFail [attacker] [operator] do
+    exerciseCmd proposalCid UpgradeProposal_Approve with
+      approver = attacker
+
+  return ()
+
+-- | Test: Cannot activate upgrade without approval
+test_UnauthorizedUpgradeActivation : Script ()
+test_UnauthorizedUpgradeActivation = do
+  operator <- allocateParty "Operator"
+  gov1 <- allocateParty "Governor1"
+  
+  now <- getTime
+
+  proposalCid <- submit operator do
+    createCmd UpgradeProposal with
+      operator
+      governance = [gov1]
+      approvalThreshold = 1
+      approvals = Set.empty  -- No approvals yet
+      sourceVersion = "V2"
+      targetVersion = "V3"
+      migrationScriptHash = hash64
+      changelogUri = "https://example.com/v3"
+      proposedAt = now
+      activationDelay = days 1
+      migrationWindowDays = 30
+      rollbackWindowDays = 7
+      status = Proposed  -- Still pending
+
+  -- Try to activate without approval
+  submitMustFail operator do
+    exerciseCmd proposalCid UpgradeProposal_Activate with
+      activator = operator
+
+  return ()
+
+-- ============================================================
+--                     6. DOUBLE-SPEND PREVENTION
+-- ============================================================
+
+-- | Test: Cannot exercise choice on archived contract (double-spend)
+test_DoubleSpendPrevented : Script ()
+test_DoubleSpendPrevented = do
+  operator <- allocateParty "Operator"
+  owner <- allocateParty "Owner"
+  receiver1 <- allocateParty "Receiver1"
+  receiver2 <- allocateParty "Receiver2"
+
+  -- Create mUSD
+  musdCid <- submitMulti [operator, owner] [] do
+    createCmd MintedMUSD with
+      issuer = operator
+      owner = owner
+      amount = 100.0
+      blacklisted = False
+      agreementHash = hash64
+      agreementUri = "https://example.com"
+      observers = []
+
+  -- First transfer (valid)
+  regulator <- allocateParty "Regulator"
+  now <- getTime
+  complianceCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.empty
+      frozen = Set.empty
+      lastUpdated = now
+  -- Canton 3.x / LF 2.x: operator must be actAs (not readAs) for inner
+  -- exercise visibility on ComplianceRegistry within MUSD_Transfer choice body.
+  proposalCid <- submitMulti [owner, operator] [] do
+    exerciseCmd musdCid MUSD_Transfer with
+      newOwner = receiver1
+      complianceRegistryCid = complianceCid
+
+  -- Contract is now archived. Try to transfer again (double-spend)
+  -- This will fail because the contract no longer exists
+  submitMultiMustFail [owner, operator] [] do
+    exerciseCmd musdCid MUSD_Transfer with
+      newOwner = receiver2
+      complianceRegistryCid = complianceCid
+
+  return ()
+
+-- ============================================================
+--                     MAIN TEST RUNNER
+-- ============================================================
+
+-- | Run all negative tests
+runAllNegativeTests : Script ()
+runAllNegativeTests = do
+  debug "=== RUNNING NEGATIVE TEST SUITE ==="
+  
+  debug "1. Authorization Tests"
+  test_UnauthorizedMint
+  debug "  ✓ test_UnauthorizedMint"
+  
+  test_UnauthorizedLargeMintApproval
+  debug "  ✓ test_UnauthorizedLargeMintApproval"
+  
+  test_UnauthorizedTransfer
+  debug "  ✓ test_UnauthorizedTransfer"
+  
+  debug "2. Compliance Tests"
+  test_BlacklistedCannotTransfer
+  debug "  ✓ test_BlacklistedCannotTransfer"
+  
+  test_FrozenPartyCannotOperate
+  debug "  ✓ test_FrozenPartyCannotOperate"
+
+  test_BlacklistedMinterCannotValidateMint
+  debug "  ✓ test_BlacklistedMinterCannotValidateMint"
+  
+  debug "3. State Validation Tests"
+  test_InvalidAmountRejected
+  debug "  ✓ test_InvalidAmountRejected"
+  
+  test_InvalidSplitRejected
+  debug "  ✓ test_InvalidSplitRejected"
+  
+  test_SupplyCapEnforced
+  debug "  ✓ test_SupplyCapEnforced"
+  
+  debug "4. Governance Tests"
+  test_InsufficientApprovalsRejected
+  debug "  ✓ test_InsufficientApprovalsRejected"
+  
+  test_NonGovernorCannotApprove
+  debug "  ✓ test_NonGovernorCannotApprove"
+  
+  debug "5. Upgrade Tests"
+  test_UnauthorizedUpgradeApproval
+  debug "  ✓ test_UnauthorizedUpgradeApproval"
+  
+  test_UnauthorizedUpgradeActivation
+  debug "  ✓ test_UnauthorizedUpgradeActivation"
+  
+  debug "6. Double-Spend Prevention"
+  test_DoubleSpendPrevented
+  debug "  ✓ test_DoubleSpendPrevented"
+  
+  debug "=== ALL 14 NEGATIVE TESTS PASSED ==="
+  return ()

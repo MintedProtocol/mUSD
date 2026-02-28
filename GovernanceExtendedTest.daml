@@ -1,0 +1,653 @@
+-- | GovernanceExtendedTest
+-- Tests for Governance module: GovernanceConfig, MultiSigProposal,
+-- MinterRegistry, GovernanceActionLog, EmergencyPauseState.
+
+module GovernanceExtendedTest where
+
+import Governance
+import Compliance
+import DA.List (head)
+import DA.Set qualified as Set
+import DA.Time
+import DA.Date
+import DA.Optional
+import Daml.Script
+
+-- ============================================================
+--                     HELPERS
+-- ============================================================
+
+setupGov : Script (Party, Party, Party, Party, ContractId GovernanceConfig)
+setupGov = script do
+  admin <- allocateParty "Admin"
+  guardian1 <- allocateParty "Guardian1"
+  guardian2 <- allocateParty "Guardian2"
+  guardian3 <- allocateParty "Guardian3"
+  cfg <- submit admin do
+    createCmd GovernanceConfig with
+      operator = admin
+      governors = [(admin, Admin), (guardian1, Guardian), (guardian2, Guardian), (guardian3, Guardian)]
+      standardThreshold = 2
+      elevatedThreshold = 3
+      timelockDuration = hours 24
+      proposalExpiry = hours 168
+      observers = []
+  pure (admin, guardian1, guardian2, guardian3, cfg)
+
+-- Helper to create a governance proof for tests requiring governance-gated actions
+createTestGovProof : Party -> ActionType -> Text -> Script (ContractId GovernanceActionLog)
+createTestGovProof operator actionType targetModule = do
+  now <- getTime
+  submit operator do
+    createCmd GovernanceActionLog with
+      operator; proposalId = "test-proof"
+      actionType; description = "Test governance proof"
+      payload = "{}"; payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      targetModule; approvers = [operator]
+      executedBy = operator; executedAt = now
+
+-- ============================================================
+--         TEST 1: CREATE MULTI-SIG PROPOSAL
+-- ============================================================
+
+test_CreateProposal : Script ()
+test_CreateProposal = script do
+  (admin, g1, g2, g3, cfg) <- setupGov
+  now <- getTime
+
+  proposal <- submit admin do
+    createCmd MultiSigProposal with
+      proposalId = "prop-1"
+      operator = admin
+      proposer = admin
+      governors = [admin, g1, g2, g3]
+      actionType = ParameterUpdate
+      description = "Increase supply cap to 10M"
+      payload = "{\"newCap\": 10000000}"
+      targetModule = "CantonDirectMint"
+      payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      requiredApprovals = 2
+      approvals = Set.fromList [admin]
+      rejections = Set.empty
+      proposedAt = now
+      expiresAt = addRelTime now (hours 168)
+      timelockEndsAt = None
+      timelockDuration = hours 24
+      status = Pending
+      observers = []
+
+  r <- queryContractId admin proposal
+  assertMsg "proposal created" (isSome r)
+  pure ()
+
+-- ============================================================
+--         TEST 2: APPROVE PROPOSAL — ACCUMULATE APPROVALS
+-- ============================================================
+
+test_ApproveProposal : Script ()
+test_ApproveProposal = script do
+  (admin, g1, g2, g3, cfg) <- setupGov
+  now <- getTime
+
+  proposal <- submit admin do
+    createCmd MultiSigProposal with
+      proposalId = "prop-2"
+      operator = admin
+      proposer = admin
+      governors = [admin, g1, g2, g3]
+      actionType = ParameterUpdate
+      description = "Increase supply cap to 10M"
+      payload = "{\"newCap\": 10000000}"
+      targetModule = "CantonDirectMint"
+      payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      requiredApprovals = 2
+      approvals = Set.fromList [admin]
+      rejections = Set.empty
+      proposedAt = now
+      expiresAt = addRelTime now (hours 168)
+      timelockEndsAt = None
+      timelockDuration = hours 24
+      status = Pending
+      observers = []
+
+  proposal2 <- submit g1 do
+    exerciseCmd proposal Proposal_Approve with approver = g1
+
+  r <- queryContractId admin proposal2
+  case r of
+    Some p -> assertMsg "g1 approved" (Set.member g1 p.approvals)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 3: REJECT PROPOSAL
+-- ============================================================
+
+test_RejectProposal : Script ()
+test_RejectProposal = script do
+  (admin, g1, g2, g3, cfg) <- setupGov
+  now <- getTime
+
+  proposal <- submit admin do
+    createCmd MultiSigProposal with
+      proposalId = "prop-3"
+      operator = admin
+      proposer = admin
+      governors = [admin, g1, g2, g3]
+      actionType = ParameterUpdate
+      description = "Increase supply cap to 10M"
+      payload = "{\"newCap\": 10000000}"
+      targetModule = "CantonDirectMint"
+      payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      requiredApprovals = 2
+      approvals = Set.fromList [admin]
+      rejections = Set.empty
+      proposedAt = now
+      expiresAt = addRelTime now (hours 168)
+      timelockEndsAt = None
+      timelockDuration = hours 24
+      status = Pending
+      observers = []
+
+  proposal2 <- submit g1 do
+    exerciseCmd proposal Proposal_Reject with rejector = g1; reason = "Too risky"
+
+  r <- queryContractId admin proposal2
+  case r of
+    Some p -> assertMsg "g1 rejected" (Set.member g1 p.rejections)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 4: CANCEL PROPOSAL — BY PROPOSER
+-- ============================================================
+
+test_CancelProposal : Script ()
+test_CancelProposal = script do
+  (admin, g1, g2, g3, cfg) <- setupGov
+  now <- getTime
+
+  proposal <- submit admin do
+    createCmd MultiSigProposal with
+      proposalId = "prop-4"
+      operator = admin
+      proposer = admin
+      governors = [admin, g1, g2, g3]
+      actionType = ParameterUpdate
+      description = "Cancel test"
+      payload = "{}"
+      targetModule = "CantonDirectMint"
+      payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      requiredApprovals = 2
+      approvals = Set.fromList [admin]
+      rejections = Set.empty
+      proposedAt = now
+      expiresAt = addRelTime now (hours 168)
+      timelockEndsAt = None
+      timelockDuration = hours 24
+      status = Pending
+      observers = []
+
+  submit admin do
+    exerciseCmd proposal Proposal_Cancel with reason = "No longer needed"
+
+  r <- queryContractId admin proposal
+  assertMsg "proposal archived" (isNone r)
+  pure ()
+
+-- ============================================================
+--         TEST 5: EXECUTE PROPOSAL AFTER TIMELOCK
+-- ============================================================
+
+test_ExecuteProposal : Script ()
+test_ExecuteProposal = script do
+  (admin, g1, g2, g3, cfg) <- setupGov
+  now <- getTime
+
+  proposal <- submit admin do
+    createCmd MultiSigProposal with
+      proposalId = "prop-5"
+      operator = admin
+      proposer = admin
+      governors = [admin, g1, g2, g3]
+      actionType = ParameterUpdate
+      description = "Execute test"
+      payload = "{}"
+      targetModule = "CantonDirectMint"
+      payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      requiredApprovals = 2
+      approvals = Set.fromList [admin, g1]
+      rejections = Set.empty
+      proposedAt = now
+      expiresAt = addRelTime now (hours 168)
+      timelockEndsAt = Some now  -- timelock already passed
+      timelockDuration = hours 24
+      status = Approved
+      observers = []
+
+  submit admin do
+    exerciseCmd proposal Proposal_Execute with executor = admin
+
+  r <- queryContractId admin proposal
+  assertMsg "proposal executed/archived" (isNone r)
+  pure ()
+
+-- ============================================================
+--         TEST 6: EXECUTE BEFORE TIMELOCK FAILS
+-- ============================================================
+
+test_ExecuteBeforeTimelockFails : Script ()
+test_ExecuteBeforeTimelockFails = script do
+  (admin, g1, g2, g3, cfg) <- setupGov
+  now <- getTime
+
+  proposal <- submit admin do
+    createCmd MultiSigProposal with
+      proposalId = "prop-6"
+      operator = admin
+      proposer = admin
+      governors = [admin, g1, g2, g3]
+      actionType = ParameterUpdate
+      description = "Too early"
+      payload = "{}"
+      targetModule = "CantonDirectMint"
+      payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      requiredApprovals = 2
+      approvals = Set.fromList [admin, g1]
+      rejections = Set.empty
+      proposedAt = now
+      expiresAt = addRelTime now (hours 168)
+      timelockEndsAt = Some (addRelTime now (hours 48))  -- far future
+      timelockDuration = hours 24
+      status = Approved
+      observers = []
+
+  submitMustFail admin do
+    exerciseCmd proposal Proposal_Execute with executor = admin
+  pure ()
+
+-- ============================================================
+--         TEST 7: EXECUTE WITHOUT ENOUGH APPROVALS FAILS
+-- ============================================================
+
+test_ExecuteInsufficientApprovalsFails : Script ()
+test_ExecuteInsufficientApprovalsFails = script do
+  (admin, g1, g2, g3, cfg) <- setupGov
+  now <- getTime
+
+  proposal <- submit admin do
+    createCmd MultiSigProposal with
+      proposalId = "prop-7"
+      operator = admin
+      proposer = admin
+      governors = [admin, g1, g2, g3]
+      actionType = ParameterUpdate
+      description = "Not enough"
+      payload = "{}"
+      targetModule = "CantonDirectMint"
+      payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      requiredApprovals = 2
+      approvals = Set.fromList [admin]  -- only 1, need 2
+      rejections = Set.empty
+      proposedAt = now
+      expiresAt = addRelTime now (hours 168)
+      timelockEndsAt = Some now
+      timelockDuration = hours 24
+      status = Pending  -- Not Approved, so Execute should fail
+      observers = []
+
+  submitMustFail admin do
+    exerciseCmd proposal Proposal_Execute with executor = admin
+  pure ()
+
+-- ============================================================
+--         TEST 8: MINTER REGISTRY — ADD MINTER
+-- ============================================================
+
+test_AddMinter : Script ()
+test_AddMinter = script do
+  admin <- allocateParty "Admin"
+  alice <- allocateParty "Alice"
+
+  registry <- submit admin do
+    createCmd MinterRegistry with
+      operator = admin
+      governance = admin
+      minters = []
+      defaultQuota = 1_000_000.0
+      totalMinted = 0.0
+      observers = []
+
+  govProof <- createTestGovProof admin MinterAuthorization "MinterRegistry"
+  registry2 <- submit admin do
+    exerciseCmd registry MinterRegistry_AddMinter with
+      newMinter = alice; quota = 1_000_000.0; governanceProofCid = govProof
+
+  r <- queryContractId admin registry2
+  case r of
+    Some reg -> assertMsg "alice added" (not (null reg.minters))
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 9: MINTER REGISTRY — REMOVE MINTER
+-- ============================================================
+
+test_RemoveMinter : Script ()
+test_RemoveMinter = script do
+  admin <- allocateParty "Admin"
+  alice <- allocateParty "Alice"
+
+  registry <- submit admin do
+    createCmd MinterRegistry with
+      operator = admin
+      governance = admin
+      minters = [(alice, 1_000_000.0)]
+      defaultQuota = 1_000_000.0
+      totalMinted = 0.0
+      observers = []
+
+  govProof <- createTestGovProof admin MinterAuthorization "MinterRegistry"
+  registry2 <- submit admin do
+    exerciseCmd registry MinterRegistry_RemoveMinter with
+      minterToRemove = alice; governanceProofCid = govProof
+
+  r <- queryContractId admin registry2
+  case r of
+    Some reg -> assertMsg "minters empty" (null reg.minters)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 10: USE MINT QUOTA
+-- ============================================================
+
+test_UseMintQuota : Script ()
+test_UseMintQuota = script do
+  admin <- allocateParty "Admin"
+  alice <- allocateParty "Alice"
+
+  registry <- submit admin do
+    createCmd MinterRegistry with
+      operator = admin
+      governance = admin
+      minters = [(alice, 1_000_000.0)]
+      defaultQuota = 1_000_000.0
+      totalMinted = 0.0
+      observers = []
+
+  registry2 <- submit admin do
+    exerciseCmd registry MinterRegistry_UseMintQuota with minter = alice; amount = 500_000.0
+
+  r <- queryContractId admin registry2
+  case r of
+    Some reg -> do
+      let (_, remainingQuota) = head reg.minters
+      assertMsg "used 500k" (remainingQuota == 500_000.0)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 11: MINT QUOTA EXCEEDED FAILS
+-- ============================================================
+
+test_MintQuotaExceededFails : Script ()
+test_MintQuotaExceededFails = script do
+  admin <- allocateParty "Admin"
+  alice <- allocateParty "Alice"
+
+  registry <- submit admin do
+    createCmd MinterRegistry with
+      operator = admin
+      governance = admin
+      minters = [(alice, 100_000.0)]  -- only 100k remaining
+      defaultQuota = 1_000_000.0
+      totalMinted = 900_000.0
+      observers = []
+
+  submitMustFail admin do
+    exerciseCmd registry MinterRegistry_UseMintQuota with minter = alice; amount = 200_000.0
+  pure ()
+
+-- ============================================================
+--         TEST 12: REPLENISH QUOTA
+-- ============================================================
+
+test_ReplenishQuota : Script ()
+test_ReplenishQuota = script do
+  admin <- allocateParty "Admin"
+  alice <- allocateParty "Alice"
+
+  registry <- submit admin do
+    createCmd MinterRegistry with
+      operator = admin
+      governance = admin
+      minters = [(alice, 100_000.0)]  -- low quota
+      defaultQuota = 1_000_000.0
+      totalMinted = 900_000.0
+      observers = []
+
+  govProof <- createTestGovProof admin MinterAuthorization "MinterRegistry"
+  registry2 <- submit admin do
+    exerciseCmd registry MinterRegistry_ReplenishQuota with
+      minter = alice; additionalQuota = 500_000.0; governanceProofCid = govProof
+
+  r <- queryContractId admin registry2
+  case r of
+    Some reg -> do
+      let (_, quota) = head reg.minters
+      assertMsg "quota replenished" (quota == 600_000.0)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 13: GOVERNANCE ACTION LOG — CONSUME PROOF
+-- ============================================================
+
+test_ConsumeProof : Script ()
+test_ConsumeProof = script do
+  admin <- allocateParty "Admin"
+  now <- getTime
+
+  proof <- submit admin do
+    createCmd GovernanceActionLog with
+      operator = admin
+      proposalId = "test-consume"
+      actionType = ParameterUpdate
+      description = "Test proof"
+      payload = "{}"
+      payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      targetModule = "CantonDirectMint"
+      approvers = [admin]
+      executedBy = admin
+      executedAt = now
+
+  submit admin do
+    exerciseCmd proof ConsumeProof with consumedBy = admin
+
+  r <- queryContractId admin proof
+  assertMsg "proof consumed/archived" (isNone r)
+  pure ()
+
+-- ============================================================
+--         TEST 14: EMERGENCY PAUSE — TRIGGER
+-- ============================================================
+
+test_EmergencyPauseTrigger : Script ()
+test_EmergencyPauseTrigger = script do
+  admin <- allocateParty "Admin"
+  g1 <- allocateParty "Guardian1"
+  g2 <- allocateParty "Guardian2"
+  now <- getTime
+
+  pause <- submit admin do
+    createCmd EmergencyPauseState with
+      operator = admin
+      guardians = [g1, g2]
+      isPaused = False
+      pausedAt = None
+      pausedBy = None
+      pauseReason = None
+      lastUpdated = now
+      pauseThreshold = 2
+      pauseApprovals = Set.empty
+
+  pause2 <- submit g1 do
+    exerciseCmd pause EmergencyPause_Trigger with guardian = g1; reason = "Suspicious activity"
+
+  r <- queryContractId admin pause2
+  case r of
+    Some p -> assertMsg "g1 approval recorded" (Set.member g1 p.pauseApprovals)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 15: EMERGENCY PAUSE — MULTI-GUARDIAN THRESHOLD
+-- ============================================================
+
+test_EmergencyPauseThreshold : Script ()
+test_EmergencyPauseThreshold = script do
+  admin <- allocateParty "Admin"
+  g1 <- allocateParty "Guardian1"
+  g2 <- allocateParty "Guardian2"
+  now <- getTime
+
+  pause <- submit admin do
+    createCmd EmergencyPauseState with
+      operator = admin
+      guardians = [g1, g2]
+      isPaused = False
+      pausedAt = None
+      pausedBy = None
+      pauseReason = None
+      lastUpdated = now
+      pauseThreshold = 2
+      pauseApprovals = Set.fromList [g1]
+
+  pause2 <- submit g2 do
+    exerciseCmd pause EmergencyPause_Trigger with guardian = g2; reason = "Confirmed attack"
+
+  r <- queryContractId admin pause2
+  case r of
+    Some p -> assertMsg "paused" p.isPaused
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 16: EMERGENCY PAUSE — RESUME
+-- ============================================================
+
+test_EmergencyPauseResume : Script ()
+test_EmergencyPauseResume = script do
+  admin <- allocateParty "Admin"
+  now <- getTime
+
+  pause <- submit admin do
+    createCmd EmergencyPauseState with
+      operator = admin
+      guardians = [admin]
+      isPaused = True
+      pausedAt = Some now
+      pausedBy = Some admin
+      pauseReason = Some "Emergency"
+      lastUpdated = now
+      pauseThreshold = 1
+      pauseApprovals = Set.empty
+
+  govProof <- createTestGovProof admin EmergencyPause "EmergencyPauseState"
+
+  pause2 <- submit admin do
+    exerciseCmd pause EmergencyPause_Resume with governanceProofCid = govProof
+
+  r <- queryContractId admin pause2
+  case r of
+    Some p -> assertMsg "resumed" (not p.isPaused)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 17: IS PAUSED
+-- ============================================================
+
+test_IsPaused : Script ()
+test_IsPaused = script do
+  admin <- allocateParty "Admin"
+  now <- getTime
+
+  pause <- submit admin do
+    createCmd EmergencyPauseState with
+      operator = admin
+      guardians = [admin]
+      isPaused = True
+      pausedAt = Some now
+      pausedBy = Some admin
+      pauseReason = Some "Test"
+      lastUpdated = now
+      pauseThreshold = 1
+      pauseApprovals = Set.empty
+
+  result <- submit admin do
+    exerciseCmd pause EmergencyPause_IsPaused with requester = admin
+
+  assertMsg "is paused" result
+  pure ()
+
+-- ============================================================
+--         TEST 18: DUPLICATE TRIGGER FAILS
+-- ============================================================
+
+test_DuplicateTriggerFails : Script ()
+test_DuplicateTriggerFails = script do
+  admin <- allocateParty "Admin"
+  g1 <- allocateParty "Guardian1"
+  now <- getTime
+
+  pause <- submit admin do
+    createCmd EmergencyPauseState with
+      operator = admin
+      guardians = [g1, admin]
+      isPaused = False
+      pausedAt = None
+      pausedBy = None
+      pauseReason = None
+      lastUpdated = now
+      pauseThreshold = 2
+      pauseApprovals = Set.fromList [g1]
+
+  submitMustFail g1 do
+    exerciseCmd pause EmergencyPause_Trigger with guardian = g1; reason = "Duplicate"
+  pure ()
+
+-- ============================================================
+--         TEST 19: GET THRESHOLD
+-- ============================================================
+
+test_GetThreshold : Script ()
+test_GetThreshold = script do
+  (admin, g1, g2, g3, cfg) <- setupGov
+
+  threshold <- submit admin do
+    exerciseCmd cfg GovConfig_GetThreshold with
+      actionType = ParameterUpdate; requester = admin
+
+  assertMsg "threshold is 2" (threshold == 2)
+  pure ()
+
+-- ============================================================
+--         TEST 20: HAS ROLE
+-- ============================================================
+
+test_HasRole : Script ()
+test_HasRole = script do
+  (admin, g1, g2, g3, cfg) <- setupGov
+
+  hasAdmin <- submit admin do
+    exerciseCmd cfg GovConfig_HasRole with party = admin; requiredRole = Admin
+
+  assertMsg "admin has Admin role" hasAdmin
+
+  hasGuardian <- submit g1 do
+    exerciseCmd cfg GovConfig_HasRole with party = g1; requiredRole = Guardian
+
+  assertMsg "g1 has Guardian role" hasGuardian
+  pure ()

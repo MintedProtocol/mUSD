@@ -1,0 +1,159 @@
+-- | UserPrivacySettings
+-- Unified privacy toggle for all Minted Protocol products on Canton.
+--
+-- Canton is PRIVATE BY DEFAULT:
+--   - Only signatories (issuer + owner) can see a contract
+--   - No block explorer, no public state, no data leakage
+--
+-- This module gives users a single toggle to opt into transparency:
+--   - Private (default): Only you and the protocol operator see your positions
+--   - Transparent (opt-in): You choose exactly who else can see your positions
+--
+-- Use cases:
+--   - Institutional: Add compliance officer, fund admin, auditor as observers
+--   - DAO treasury: Add all DAO members as observers for full transparency
+--   - Personal: Keep everything private (no UserPrivacySettings needed)
+--
+-- How it works:
+--   1. User creates UserPrivacySettings with their desired observers
+--   2. When ANY product creates a user-facing contract (mUSD, sMUSD, LP, escrow, debt),
+--      it looks up the user's settings and applies the observers
+--   3. User can update their observers at any time — new contracts use new settings
+--   4. Existing contracts can be refreshed via UpdateObservers choice
+--
+-- Products covered:
+--   CantonMUSD, CantonUSDC, USDCx, CantonSMUSD, CantonCoin,
+--   BoostPoolLP, EscrowedCollateral, CantonDebtPosition
+
+module UserPrivacySettings where
+
+import DA.Optional (fromOptional)
+
+-- ============================================================
+--                     PRIVACY MODE ENUM
+-- ============================================================
+
+-- | Privacy mode for a user's positions
+data PrivacyMode
+  = FullyPrivate           -- Default: only issuer + owner can see
+  | SelectiveTransparency  -- User picks specific observers
+  deriving (Eq, Show)
+
+-- ============================================================
+--                     USER PRIVACY SETTINGS
+-- ============================================================
+
+-- | One per user per operator. Keyed for easy lookup from any product.
+-- If no UserPrivacySettings exists for a user, they are FULLY PRIVATE.
+template UserPrivacySettings
+  with
+    operator      : Party
+    user          : Party
+    mode          : PrivacyMode
+    observers     : [Party]         -- Parties who can see this user's positions
+    labels        : [Text]          -- Human-readable labels for each observer
+    createdAt     : Time
+    updatedAt     : Time
+  where
+    signatory operator, user
+
+    ensure case mode of
+      FullyPrivate -> null observers       -- Private = no observers
+      SelectiveTransparency -> True        -- Can have 0+ observers (transitional)
+
+    -- | Add an observer to all future positions
+    choice Privacy_AddObserver : ContractId UserPrivacySettings
+      with
+        newObserver : Party
+        label       : Text          -- e.g. "Auditor", "Compliance", "Fund Admin"
+      controller user
+      do
+        assertMsg "ALREADY_OBSERVER" (newObserver `notElem` observers)
+        assertMsg "CANNOT_OBSERVE_SELF" (newObserver /= user)
+        assertMsg "CANNOT_OBSERVE_OPERATOR" (newObserver /= operator)
+        assertMsg "LABEL_REQUIRED" (label /= "")
+        now <- getTime
+        create this with
+          mode = SelectiveTransparency
+          observers = newObserver :: observers
+          labels = label :: labels
+          updatedAt = now
+
+    -- | Remove an observer from future positions
+    choice Privacy_RemoveObserver : ContractId UserPrivacySettings
+      with
+        removeObserver : Party
+      controller user
+      do
+        assertMsg "NOT_AN_OBSERVER" (removeObserver `elem` observers)
+        now <- getTime
+        let (newObs, newLabels) = unzip
+              [(o, l) | (o, l) <- zip observers labels, o /= removeObserver]
+        let newMode = if null newObs then FullyPrivate else SelectiveTransparency
+        create this with
+          mode = newMode
+          observers = newObs
+          labels = newLabels
+          updatedAt = now
+
+    -- | Go fully private — remove ALL observers
+    choice Privacy_GoPrivate : ContractId UserPrivacySettings
+      controller user
+      do
+        now <- getTime
+        create this with
+          mode = FullyPrivate
+          observers = []
+          labels = []
+          updatedAt = now
+
+    -- | Replace all observers at once (bulk update)
+    choice Privacy_SetObservers : ContractId UserPrivacySettings
+      with
+        newObservers : [Party]
+        newLabels    : [Text]
+      controller user
+      do
+        assertMsg "OBSERVERS_LABELS_MISMATCH" (length newObservers == length newLabels)
+        assertMsg "CANNOT_OBSERVE_SELF" (user `notElem` newObservers)
+        assertMsg "CANNOT_OBSERVE_OPERATOR" (operator `notElem` newObservers)
+        now <- getTime
+        let newMode = if null newObservers then FullyPrivate else SelectiveTransparency
+        create this with
+          mode = newMode
+          observers = newObservers
+          labels = newLabels
+          updatedAt = now
+
+    -- | View current settings (nonconsuming)
+    nonconsuming choice Privacy_GetSettings : (PrivacyMode, [Party])
+      with
+        requester : Party
+      controller requester
+      do
+        assertMsg "NOT_AUTHORIZED" (requester == user || requester == operator)
+        return (mode, observers)
+
+-- ============================================================
+--                     HELPER: LOOKUP OBSERVERS
+-- ============================================================
+
+-- | Look up a user's privacy observers.
+-- DAML-H-02 FIX: LF 2.x removed contract key uniqueness guarantees, so
+-- lookupByKey can no longer be used to find UserPrivacySettings.
+--
+-- New approach: callers pass an Optional ContractId.
+--   Some cid → fetch the contract, validate operator/user match, return observers
+--   None     → return [] (fully private — safe default)
+--
+-- For UpdateObservers choices: user provides their settings CID explicitly.
+-- For service choices (Stake, Unstake, etc.): pass None for default privacy;
+--   users can call UpdateObservers on created contracts afterwards.
+lookupUserObservers : Party -> Party -> Optional (ContractId UserPrivacySettings) -> Update [Party]
+lookupUserObservers _operator _user None = return []  -- No settings = fully private
+lookupUserObservers operator user (Some settingsCid) = do
+  settings <- fetch settingsCid
+  -- Validate the fetched contract belongs to the correct operator/user pair
+  assertMsg "PRIVACY_SETTINGS_OPERATOR_MISMATCH" (settings.operator == operator)
+  assertMsg "PRIVACY_SETTINGS_USER_MISMATCH" (settings.user == user)
+  return settings.observers

@@ -1,0 +1,642 @@
+-- | UserPrivacySettingsTest
+-- Tests for the unified privacy toggle across all Minted products.
+-- Covers: default privacy, add/remove observers, go private, bulk set,
+-- observer propagation to product contracts, and negative tests.
+
+module UserPrivacySettingsTest where
+
+import Daml.Script
+import DA.Time
+import DA.Date
+import DA.Optional (fromSome)
+import DA.List (head)
+import UserPrivacySettings
+import CantonDirectMint (CantonMUSD(..), CantonUSDC(..), USDCx(..))
+import CantonSMUSD (CantonSMUSD(..))
+import CantonCoinToken (CantonCoin(..))
+import CantonLending (EscrowedCollateral(..), CantonDebtPosition(..), CollateralType(..))
+
+-- ============================================================
+--                     HELPERS
+-- ============================================================
+
+baseTime : Time
+baseTime = time (date 2026 Jan 1) 0 0 0
+
+-- | Create privacy settings for a user (default: fully private, no observers)
+createPrivateSettings : Party -> Party -> Script (ContractId UserPrivacySettings)
+createPrivateSettings operator user =
+  submitMulti [operator, user] [] do
+    createCmd UserPrivacySettings with
+      operator
+      user
+      mode = FullyPrivate
+      observers = []
+      labels = []
+      createdAt = baseTime
+      updatedAt = baseTime
+
+-- ============================================================
+--         1. DEFAULT PRIVACY (NO SETTINGS)
+-- ============================================================
+
+-- | Without UserPrivacySettings, lookupUserObservers returns []
+testDefaultPrivacy : Script ()
+testDefaultPrivacy = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  -- Alice has NO UserPrivacySettings
+  -- Any product that calls lookupUserObservers gets []
+  -- Verify by creating an mUSD with privacyObservers = []
+  musdCid <- submitMulti [operator, alice] [] do
+    createCmd CantonMUSD with
+      issuer = operator
+      owner = alice
+      amount = 1000.0
+      agreementHash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+      agreementUri = "https://minted.app/terms"
+      privacyObservers = []
+
+  musd <- queryContractId operator musdCid
+  let m = fromSome musd
+  assertMsg "No observers" (m.privacyObservers == [])
+  debug "✅ 1. Default privacy — no settings, no observers"
+
+-- ============================================================
+--         2. CREATE PRIVACY SETTINGS (FULLY PRIVATE)
+-- ============================================================
+
+testCreatePrivateSettings : Script ()
+testCreatePrivateSettings = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  settings <- queryContractId operator settingsCid
+  let s = fromSome settings
+  assertMsg "Mode is FullyPrivate" (s.mode == FullyPrivate)
+  assertMsg "No observers" (null s.observers)
+  assertMsg "No labels" (null s.labels)
+  debug "✅ 2. Create fully private settings"
+
+-- ============================================================
+--         3. ADD OBSERVER
+-- ============================================================
+
+testAddObserver : Script ()
+testAddObserver = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  -- Alice adds auditor as observer
+  newSettingsCid <- submit alice do
+    exerciseCmd settingsCid Privacy_AddObserver with
+      newObserver = auditor
+      label = "External Auditor"
+
+  settings <- queryContractId operator newSettingsCid
+  let s = fromSome settings
+  assertMsg "Mode is SelectiveTransparency" (s.mode == SelectiveTransparency)
+  assertMsg "One observer" (length s.observers == 1)
+  assertMsg "Observer is auditor" (s.observers == [auditor])
+  assertMsg "Label stored" (s.labels == ["External Auditor"])
+  debug "✅ 3. Add observer — mode switches to SelectiveTransparency"
+
+-- ============================================================
+--         4. ADD MULTIPLE OBSERVERS
+-- ============================================================
+
+testAddMultipleObservers : Script ()
+testAddMultipleObservers = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+  compliance <- allocateParty "Compliance"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  -- Add auditor
+  s1 <- submit alice do
+    exerciseCmd settingsCid Privacy_AddObserver with
+      newObserver = auditor
+      label = "Auditor"
+
+  -- Add compliance
+  s2 <- submit alice do
+    exerciseCmd s1 Privacy_AddObserver with
+      newObserver = compliance
+      label = "Compliance Officer"
+
+  settings <- queryContractId operator s2
+  let s = fromSome settings
+  assertMsg "Two observers" (length s.observers == 2)
+  assertMsg "Compliance first (prepended)" (head s.observers == compliance)
+  debug "✅ 4. Multiple observers added"
+
+-- ============================================================
+--         5. REMOVE OBSERVER
+-- ============================================================
+
+testRemoveObserver : Script ()
+testRemoveObserver = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+  compliance <- allocateParty "Compliance"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  s1 <- submit alice do
+    exerciseCmd settingsCid Privacy_AddObserver with
+      newObserver = auditor
+      label = "Auditor"
+
+  s2 <- submit alice do
+    exerciseCmd s1 Privacy_AddObserver with
+      newObserver = compliance
+      label = "Compliance"
+
+  -- Remove auditor
+  s3 <- submit alice do
+    exerciseCmd s2 Privacy_RemoveObserver with
+      removeObserver = auditor
+
+  settings <- queryContractId operator s3
+  let s = fromSome settings
+  assertMsg "One observer left" (length s.observers == 1)
+  assertMsg "Compliance remains" (head s.observers == compliance)
+  assertMsg "Still transparent" (s.mode == SelectiveTransparency)
+  debug "✅ 5. Remove observer — revokes access"
+
+-- ============================================================
+--         6. REMOVE LAST OBSERVER → BACK TO FULLY PRIVATE
+-- ============================================================
+
+testRemoveLastObserverGoesPrivate : Script ()
+testRemoveLastObserverGoesPrivate = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  s1 <- submit alice do
+    exerciseCmd settingsCid Privacy_AddObserver with
+      newObserver = auditor
+      label = "Auditor"
+
+  -- Remove the only observer
+  s2 <- submit alice do
+    exerciseCmd s1 Privacy_RemoveObserver with
+      removeObserver = auditor
+
+  settings <- queryContractId operator s2
+  let s = fromSome settings
+  assertMsg "Back to FullyPrivate" (s.mode == FullyPrivate)
+  assertMsg "No observers" (null s.observers)
+  debug "✅ 6. Remove last observer → auto-reverts to FullyPrivate"
+
+-- ============================================================
+--         7. GO PRIVATE (BULK REMOVE ALL)
+-- ============================================================
+
+testGoPrivate : Script ()
+testGoPrivate = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+  compliance <- allocateParty "Compliance"
+  fundAdmin <- allocateParty "FundAdmin"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  s1 <- submit alice do
+    exerciseCmd settingsCid Privacy_AddObserver with
+      newObserver = auditor
+      label = "Auditor"
+
+  s2 <- submit alice do
+    exerciseCmd s1 Privacy_AddObserver with
+      newObserver = compliance
+      label = "Compliance"
+
+  s3 <- submit alice do
+    exerciseCmd s2 Privacy_AddObserver with
+      newObserver = fundAdmin
+      label = "Fund Admin"
+
+  -- Go fully private — remove all observers at once
+  s4 <- submit alice do
+    exerciseCmd s3 Privacy_GoPrivate
+
+  settings <- queryContractId operator s4
+  let s = fromSome settings
+  assertMsg "FullyPrivate" (s.mode == FullyPrivate)
+  assertMsg "No observers" (null s.observers)
+  assertMsg "No labels" (null s.labels)
+  debug "✅ 7. Go private — removes all observers at once"
+
+-- ============================================================
+--         8. BULK SET OBSERVERS
+-- ============================================================
+
+testBulkSetObservers : Script ()
+testBulkSetObservers = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+  compliance <- allocateParty "Compliance"
+  fundAdmin <- allocateParty "FundAdmin"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  -- Set multiple observers at once
+  newSettingsCid <- submit alice do
+    exerciseCmd settingsCid Privacy_SetObservers with
+      newObservers = [auditor, compliance, fundAdmin]
+      newLabels = ["Auditor", "Compliance", "Fund Admin"]
+
+  settings <- queryContractId operator newSettingsCid
+  let s = fromSome settings
+  assertMsg "Three observers" (length s.observers == 3)
+  assertMsg "SelectiveTransparency" (s.mode == SelectiveTransparency)
+  debug "✅ 8. Bulk set observers"
+
+-- ============================================================
+--         9. BULK SET EMPTY → FULLY PRIVATE
+-- ============================================================
+
+testBulkSetEmptyGoesPrivate : Script ()
+testBulkSetEmptyGoesPrivate = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  s1 <- submit alice do
+    exerciseCmd settingsCid Privacy_AddObserver with
+      newObserver = auditor
+      label = "Auditor"
+
+  -- Set empty list → should revert to FullyPrivate
+  s2 <- submit alice do
+    exerciseCmd s1 Privacy_SetObservers with
+      newObservers = []
+      newLabels = []
+
+  settings <- queryContractId operator s2
+  let s = fromSome settings
+  assertMsg "FullyPrivate" (s.mode == FullyPrivate)
+  assertMsg "No observers" (null s.observers)
+  debug "✅ 9. Bulk set empty → FullyPrivate"
+
+-- ============================================================
+--         10. GET SETTINGS (NONCONSUMING)
+-- ============================================================
+
+testGetSettings : Script ()
+testGetSettings = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  s1 <- submit alice do
+    exerciseCmd settingsCid Privacy_AddObserver with
+      newObserver = auditor
+      label = "Auditor"
+
+  -- User can query their own settings
+  (mode, obs) <- submit alice do
+    exerciseCmd s1 Privacy_GetSettings with requester = alice
+
+  assertMsg "SelectiveTransparency" (mode == SelectiveTransparency)
+  assertMsg "One observer" (length obs == 1)
+
+  -- Operator can also query
+  (mode2, obs2) <- submit operator do
+    exerciseCmd s1 Privacy_GetSettings with requester = operator
+
+  assertMsg "Operator sees same" (mode2 == SelectiveTransparency)
+  debug "✅ 10. Get settings — user and operator can query"
+
+-- ============================================================
+--         11. NEGATIVE: DUPLICATE OBSERVER
+-- ============================================================
+
+testDuplicateObserverFails : Script ()
+testDuplicateObserverFails = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  s1 <- submit alice do
+    exerciseCmd settingsCid Privacy_AddObserver with
+      newObserver = auditor
+      label = "Auditor"
+
+  -- Adding same observer again should fail
+  submitMustFail alice do
+    exerciseCmd s1 Privacy_AddObserver with
+      newObserver = auditor
+      label = "Auditor Again"
+  debug "✅ 11. Duplicate observer rejected"
+
+-- ============================================================
+--         12. NEGATIVE: CANNOT OBSERVE SELF
+-- ============================================================
+
+testCannotObserveSelf : Script ()
+testCannotObserveSelf = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  -- Alice cannot add herself as observer
+  submitMustFail alice do
+    exerciseCmd settingsCid Privacy_AddObserver with
+      newObserver = alice
+      label = "Myself"
+  debug "✅ 12. Cannot observe self"
+
+-- ============================================================
+--         13. NEGATIVE: CANNOT OBSERVE OPERATOR
+-- ============================================================
+
+testCannotObserveOperator : Script ()
+testCannotObserveOperator = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  -- Cannot add operator as observer (already signatory)
+  submitMustFail alice do
+    exerciseCmd settingsCid Privacy_AddObserver with
+      newObserver = operator
+      label = "Operator"
+  debug "✅ 13. Cannot observe operator"
+
+-- ============================================================
+--         14. NEGATIVE: REMOVE NON-EXISTENT OBSERVER
+-- ============================================================
+
+testRemoveNonExistentFails : Script ()
+testRemoveNonExistentFails = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  stranger <- allocateParty "Stranger"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  -- Remove someone who isn't an observer
+  submitMustFail alice do
+    exerciseCmd settingsCid Privacy_RemoveObserver with
+      removeObserver = stranger
+  debug "✅ 14. Remove non-existent observer fails"
+
+-- ============================================================
+--         15. NEGATIVE: LABELS MISMATCH IN BULK SET
+-- ============================================================
+
+testBulkSetMismatchFails : Script ()
+testBulkSetMismatchFails = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+  compliance <- allocateParty "Compliance"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  -- 2 observers but only 1 label
+  submitMustFail alice do
+    exerciseCmd settingsCid Privacy_SetObservers with
+      newObservers = [auditor, compliance]
+      newLabels = ["Only one label"]
+  debug "✅ 15. Bulk set with mismatched labels rejected"
+
+-- ============================================================
+--         16. NEGATIVE: EMPTY LABEL
+-- ============================================================
+
+testEmptyLabelFails : Script ()
+testEmptyLabelFails = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  submitMustFail alice do
+    exerciseCmd settingsCid Privacy_AddObserver with
+      newObserver = auditor
+      label = ""
+  debug "✅ 16. Empty label rejected"
+
+-- ============================================================
+--         17. NEGATIVE: UNAUTHORIZED GET SETTINGS
+-- ============================================================
+
+testUnauthorizedGetSettings : Script ()
+testUnauthorizedGetSettings = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  stranger <- allocateParty "Stranger"
+
+  settingsCid <- createPrivateSettings operator alice
+
+  -- Stranger cannot query Alice's settings
+  submitMultiMustFail [stranger] [operator] do
+    exerciseCmd settingsCid Privacy_GetSettings with requester = stranger
+  debug "✅ 17. Unauthorized settings query rejected"
+
+-- ============================================================
+--         18. OBSERVER PROPAGATION TO MUSD
+-- ============================================================
+
+testObserverPropagationToMUSD : Script ()
+testObserverPropagationToMUSD = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+
+  -- Alice opts into transparency
+  settingsCid <- createPrivateSettings operator alice
+  _ <- submit alice do
+    exerciseCmd settingsCid Privacy_AddObserver with
+      newObserver = auditor
+      label = "Auditor"
+
+  -- Create mUSD with auditor as observer
+  musdCid <- submitMulti [operator, alice] [] do
+    createCmd CantonMUSD with
+      issuer = operator
+      owner = alice
+      amount = 1000.0
+      agreementHash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+      agreementUri = "https://minted.app/terms"
+      privacyObservers = [auditor]
+
+  -- Auditor can see the mUSD
+  musd <- queryContractId auditor musdCid
+  assertMsg "Auditor can see mUSD" (musd /= None)
+  debug "✅ 18. Observer propagation — auditor sees mUSD"
+
+-- ============================================================
+--         19. PRIVATE USER POSITION INVISIBLE TO THIRD PARTY
+-- ============================================================
+
+testPrivatePositionInvisible : Script ()
+testPrivatePositionInvisible = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  stranger <- allocateParty "Stranger"
+
+  -- Alice is fully private (no settings)
+  musdCid <- submitMulti [operator, alice] [] do
+    createCmd CantonMUSD with
+      issuer = operator
+      owner = alice
+      amount = 1000.0
+      agreementHash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+      agreementUri = "https://minted.app/terms"
+      privacyObservers = []
+
+  -- Stranger cannot see Alice's mUSD
+  musd <- queryContractId stranger musdCid
+  assertMsg "Stranger cannot see mUSD" (musd == None)
+  debug "✅ 19. Private position — invisible to third parties"
+
+-- ============================================================
+--         20. OBSERVER ON CANTON COIN
+-- ============================================================
+
+testObserverOnCantonCoin : Script ()
+testObserverOnCantonCoin = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+
+  coinCid <- submitMulti [operator, alice] [] do
+    createCmd CantonCoin with
+      issuer = operator
+      owner = alice
+      amount = 5000.0
+      privacyObservers = [auditor]
+
+  coin <- queryContractId auditor coinCid
+  assertMsg "Auditor can see CantonCoin" (coin /= None)
+  debug "✅ 20. Observer on CantonCoin"
+
+-- ============================================================
+--         21. OBSERVER ON ESCROWED COLLATERAL
+-- ============================================================
+
+testObserverOnEscrow : Script ()
+testObserverOnEscrow = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+
+  escrowCid <- submitMulti [operator, alice] [] do
+    createCmd EscrowedCollateral with
+      operator
+      owner = alice
+      collateralType = CTN_Coin
+      amount = 10000.0
+      depositedAt = baseTime
+      lastUpdatedAt = baseTime
+      privacyObservers = [auditor]
+
+  escrow <- queryContractId auditor escrowCid
+  assertMsg "Auditor can see escrow" (escrow /= None)
+  debug "✅ 21. Observer on EscrowedCollateral"
+
+-- ============================================================
+--         22. OBSERVER ON DEBT POSITION
+-- ============================================================
+
+testObserverOnDebtPosition : Script ()
+testObserverOnDebtPosition = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+
+  debtCid <- submitMulti [operator, alice] [] do
+    createCmd CantonDebtPosition with
+      operator
+      borrower = alice
+      principalDebt = 500.0
+      accruedInterest = 0.0
+      lastAccrualTime = baseTime
+      interestRateBps = 500
+      privacyObservers = [auditor]
+
+  debt <- queryContractId auditor debtCid
+  assertMsg "Auditor can see debt" (debt /= None)
+  debug "✅ 22. Observer on CantonDebtPosition"
+
+-- ============================================================
+--         23. SETTINGS KEY UNIQUENESS
+-- ============================================================
+
+-- | LF 2.x removed contract keys, so duplicate creates are now allowed.
+-- This test verifies that creating two settings for the same user does NOT fail
+-- (regression from LF 1.x where contract key uniqueness was enforced on-ledger).
+-- Application-level deduplication must be enforced by the off-ledger layer.
+testUniqueSettingsKey : Script ()
+testUniqueSettingsKey = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+
+  -- First settings succeeds
+  cid1 <- createPrivateSettings operator alice
+
+  -- LF 2.x: Second settings for same (operator, alice) now succeeds
+  -- (contract key uniqueness removed in Daml 3 / LF 2.x)
+  cid2 <- submitMulti [operator, alice] [] do
+    createCmd UserPrivacySettings with
+      operator
+      user = alice
+      mode = FullyPrivate
+      observers = []
+      labels = []
+      createdAt = baseTime
+      updatedAt = baseTime
+  -- Verify both contracts exist (application must handle dedup off-ledger)
+  s1 <- queryContractId operator cid1
+  s2 <- queryContractId operator cid2
+  assertMsg "Both settings exist" (s1 /= None && s2 /= None)
+  debug "✅ 23. LF 2.x: Duplicate settings allowed (dedup is off-ledger)"
+
+-- ============================================================
+--         24. ENSURE: FULLY PRIVATE CANNOT HAVE OBSERVERS
+-- ============================================================
+
+testFullyPrivateEnsure : Script ()
+testFullyPrivateEnsure = do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  auditor <- allocateParty "Auditor"
+
+  -- Try to create FullyPrivate with observers — should fail ensure
+  submitMultiMustFail [operator, alice] [] do
+    createCmd UserPrivacySettings with
+      operator
+      user = alice
+      mode = FullyPrivate
+      observers = [auditor]
+      labels = ["Auditor"]
+      createdAt = baseTime
+      updatedAt = baseTime
+  debug "✅ 24. Ensure — FullyPrivate cannot have observers"

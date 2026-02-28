@@ -1,0 +1,611 @@
+-- | CantonETHPoolTest
+-- Tests for CantonETHPool module: CantonSMUSD_E token operations,
+-- ETHPool admin choices, SyncSharePrice bounds, TimeLockTier logic,
+-- and Unstake flow.
+
+module CantonETHPoolTest where
+
+import CantonETHPool
+import CantonDirectMint (CantonMUSD(..), CantonDirectMintService(..), Money, Bps)
+import Compliance (ComplianceRegistry(..), ValidateMint(..), ValidateTransfer(..))
+import DA.Set qualified as Set
+import DA.Time
+import DA.Date
+import DA.Optional
+import Daml.Script
+
+-- ============================================================
+--                     HELPERS
+-- ============================================================
+
+dummyHash : Text
+dummyHash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+
+dummyUri : Text
+dummyUri = "https://minted.app/terms"
+
+setupCompliance : Party -> Script (ContractId ComplianceRegistry)
+setupCompliance operator = do
+  regulator <- allocateParty "Regulator"
+  now <- getTime
+  submit regulator do
+    createCmd ComplianceRegistry with
+      regulator; operator
+      blacklisted = Set.empty; frozen = Set.empty; lastUpdated = now
+
+setupMintService : Party -> ContractId ComplianceRegistry -> Script (ContractId CantonDirectMintService)
+setupMintService operator regCid = do
+  now <- getTime
+  submit operator do
+    createCmd CantonDirectMintService with
+      operator
+      usdcIssuer = operator
+      usdcxIssuer = None
+      mintFeeBps = 30
+      redeemFeeBps = 30
+      minAmount = 1.0
+      maxAmount = 10_000_000.0
+      supplyCap = 100_000_000.0
+      currentSupply = 0.0
+      accumulatedFees = 0.0
+      paused = False
+      validators = [operator]
+      targetChainId = 1
+      targetTreasury = "0x1234567890abcdef1234567890abcdef12345678"
+      nextNonce = 1
+      dailyMintLimit = 50_000_000.0
+      dailyMinted = 0.0
+      dailyBurned = 0.0
+      lastRateLimitReset = now
+      complianceRegistryCid = regCid
+      mpaHash = dummyHash
+      mpaUri = dummyUri
+      authorizedMinters = []
+      cantonCoinPrice = None
+      serviceName = "test-mint-service"
+
+setupPoolService : Party -> Party -> ContractId ComplianceRegistry
+                 -> ContractId CantonDirectMintService
+                 -> Script (ContractId CantonETHPoolService)
+setupPoolService operator governance regCid mintServiceCid = do
+  submit operator do
+    createCmd CantonETHPoolService with
+      operator; governance
+      totalShares = 0.0; totalMusdStaked = 0.0
+      sharePrice = 1.0; poolCap = 10_000_000.0
+      lastSyncEpoch = 0; paused = False
+      directMintServiceCid = mintServiceCid
+      cantonCoinPrice = 2.0
+      complianceRegistryCid = regCid
+      mpaHash = dummyHash; mpaUri = dummyUri
+      musdMintCap = 10_000_000.0
+      currentUnstakeMinted = 0.0
+      observers = []
+
+-- ============================================================
+--         TEST 1: CantonSMUSD_E — CREATION
+-- ============================================================
+
+test_SmUsdECreation : Script ()
+test_SmUsdECreation = script do
+  op <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+
+  cid <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 1000.0
+      entrySharePrice = 1.0; musdStaked = 1000.0
+      tier = NoLock; stakedAt = now; unlockAt = None
+      privacyObservers = []
+
+  r <- queryContractId alice cid
+  assertMsg "created" (isSome r)
+  pure ()
+
+-- ============================================================
+--         TEST 2: CantonSMUSD_E — SPLIT
+-- ============================================================
+
+test_SmUsdESplit : Script ()
+test_SmUsdESplit = script do
+  op <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+
+  cid <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 1000.0
+      entrySharePrice = 1.0; musdStaked = 1000.0
+      tier = NoLock; stakedAt = now; unlockAt = None
+      privacyObservers = []
+
+  (c1, c2) <- submit alice do
+    exerciseCmd cid SMUSDE_Split with splitShares = 400.0
+
+  r1 <- queryContractId alice c1
+  r2 <- queryContractId alice c2
+  case (r1, r2) of
+    (Some a, Some b) -> do
+      assertMsg "split 400" (a.shares == 400.0)
+      assertMsg "split 600" (b.shares == 600.0)
+      assertMsg "musd 400" (a.musdStaked == 400.0)
+      assertMsg "musd 600" (b.musdStaked == 600.0)
+    _ -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 3: CantonSMUSD_E — MERGE
+-- ============================================================
+
+test_SmUsdEMerge : Script ()
+test_SmUsdEMerge = script do
+  op <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+
+  c1 <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 400.0
+      entrySharePrice = 1.0; musdStaked = 400.0
+      tier = NoLock; stakedAt = now; unlockAt = None
+      privacyObservers = []
+
+  c2 <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 600.0
+      entrySharePrice = 1.0; musdStaked = 600.0
+      tier = NoLock; stakedAt = now; unlockAt = None
+      privacyObservers = []
+
+  merged <- submit alice do
+    exerciseCmd c1 SMUSDE_Merge with otherCid = c2
+
+  r <- queryContractId alice merged
+  case r of
+    Some m -> do
+      assertMsg "merged 1000" (m.shares == 1000.0)
+      assertMsg "musd 1000" (m.musdStaked == 1000.0)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 4: CantonSMUSD_E — MERGE TIER MISMATCH FAILS
+-- ============================================================
+
+test_SmUsdEMergeTierMismatchFails : Script ()
+test_SmUsdEMergeTierMismatchFails = script do
+  op <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+
+  c1 <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 400.0
+      entrySharePrice = 1.0; musdStaked = 400.0
+      tier = NoLock; stakedAt = now; unlockAt = None
+      privacyObservers = []
+
+  c2 <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 600.0
+      entrySharePrice = 1.0; musdStaked = 600.0
+      tier = ShortLock; stakedAt = now
+      unlockAt = Some (addRelTime now (seconds 2592000))
+      privacyObservers = []
+
+  submitMustFail alice do
+    exerciseCmd c1 SMUSDE_Merge with otherCid = c2
+  pure ()
+
+-- ============================================================
+--         TEST 5: CantonSMUSD_E — TRANSFER PROPOSAL
+-- ============================================================
+
+test_SmUsdETransfer : Script ()
+test_SmUsdETransfer = script do
+  op <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  now <- getTime
+  reg <- setupCompliance op
+
+  cid <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 1000.0
+      entrySharePrice = 1.0; musdStaked = 1000.0
+      tier = NoLock; stakedAt = now; unlockAt = None
+      privacyObservers = []
+
+  proposal <- submitMulti [alice] [op] do
+    exerciseCmd cid SMUSDE_Transfer with
+      newOwner = bob; complianceRegistryCid = reg
+
+  newCid <- submitMulti [bob] [op] do
+    exerciseCmd proposal CantonSMUSD_ETransferProposal_Accept
+
+  r <- queryContractId bob newCid
+  case r of
+    Some m -> assertMsg "bob owns" (m.owner == bob)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 6: CantonSMUSD_E — TRANSFER CANCEL
+-- ============================================================
+
+test_SmUsdETransferCancel : Script ()
+test_SmUsdETransferCancel = script do
+  op <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  now <- getTime
+  reg <- setupCompliance op
+
+  cid <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 1000.0
+      entrySharePrice = 1.0; musdStaked = 1000.0
+      tier = NoLock; stakedAt = now; unlockAt = None
+      privacyObservers = []
+
+  proposal <- submitMulti [alice] [op] do
+    exerciseCmd cid SMUSDE_Transfer with
+      newOwner = bob; complianceRegistryCid = reg
+
+  returnedCid <- submit alice do
+    exerciseCmd proposal CantonSMUSD_ETransferProposal_Cancel
+
+  r <- queryContractId alice returnedCid
+  case r of
+    Some m -> assertMsg "alice still owns" (m.owner == alice)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 7: TIME-LOCK TIER — DURATIONS
+-- ============================================================
+
+test_TierDurations : Script ()
+test_TierDurations = script do
+  assertMsg "NoLock 0" (tierDurationSecs NoLock == 0)
+  assertMsg "ShortLock 30d" (tierDurationSecs ShortLock == 2592000)
+  assertMsg "MediumLock 90d" (tierDurationSecs MediumLock == 7776000)
+  assertMsg "LongLock 180d" (tierDurationSecs LongLock == 15552000)
+  pure ()
+
+-- ============================================================
+--         TEST 8: TIME-LOCK TIER — MULTIPLIERS
+-- ============================================================
+
+test_TierMultipliers : Script ()
+test_TierMultipliers = script do
+  assertMsg "NoLock 1.0x" (tierMultiplierBps NoLock == 10000)
+  assertMsg "ShortLock 1.25x" (tierMultiplierBps ShortLock == 12500)
+  assertMsg "MediumLock 1.5x" (tierMultiplierBps MediumLock == 15000)
+  assertMsg "LongLock 2.0x" (tierMultiplierBps LongLock == 20000)
+  pure ()
+
+-- ============================================================
+--         TEST 9: ETHPOOL ADMIN — SET POOL CAP
+-- ============================================================
+
+test_SetPoolCap : Script ()
+test_SetPoolCap = script do
+  op <- allocateParty "Operator"
+  gov <- allocateParty "Governance"
+  reg <- setupCompliance op
+  mintSvc <- setupMintService op reg
+  pool <- setupPoolService op gov reg mintSvc
+
+  pool2 <- submitMulti [op, gov] [] do
+    exerciseCmd pool ETHPool_SetPoolCap with newCap = 50_000_000.0
+
+  r <- queryContractId op pool2
+  case r of
+    Some p -> assertMsg "cap 50M" (p.poolCap == 50_000_000.0)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 11: ETHPOOL ADMIN — SET PAUSED
+-- ============================================================
+
+test_SetPaused : Script ()
+test_SetPaused = script do
+  op <- allocateParty "Operator"
+  gov <- allocateParty "Governance"
+  reg <- setupCompliance op
+  mintSvc <- setupMintService op reg
+  pool <- setupPoolService op gov reg mintSvc
+
+  pool2 <- submit op do
+    exerciseCmd pool ETHPool_SetPaused with newPaused = True
+
+  r <- queryContractId op pool2
+  case r of
+    Some p -> assertMsg "paused" p.paused
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 12: ETHPOOL ADMIN — SET CANTON COIN PRICE
+-- ============================================================
+
+test_SetCantonCoinPrice : Script ()
+test_SetCantonCoinPrice = script do
+  op <- allocateParty "Operator"
+  gov <- allocateParty "Governance"
+  reg <- setupCompliance op
+  mintSvc <- setupMintService op reg
+  pool <- setupPoolService op gov reg mintSvc
+
+  -- 10% increase (within 25% cap)
+  pool2 <- submitMulti [op, gov] [] do
+    exerciseCmd pool ETHPool_SetCantonCoinPrice with newPrice = 2.2
+
+  r <- queryContractId op pool2
+  case r of
+    Some p -> assertMsg "price 2.2" (p.cantonCoinPrice == 2.2)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 13: ETHPOOL ADMIN — COIN PRICE CHANGE TOO LARGE FAILS
+-- ============================================================
+
+test_CantonCoinPriceChangeTooBig : Script ()
+test_CantonCoinPriceChangeTooBig = script do
+  op <- allocateParty "Operator"
+  gov <- allocateParty "Governance"
+  reg <- setupCompliance op
+  mintSvc <- setupMintService op reg
+  pool <- setupPoolService op gov reg mintSvc
+
+  -- 50% increase exceeds 25% cap
+  submitMustFail op do
+    exerciseCmd pool ETHPool_SetCantonCoinPrice with newPrice = 3.0
+  pure ()
+
+-- ============================================================
+--         TEST 14: SYNC SHARE PRICE — WITHIN BOUNDS
+-- ============================================================
+
+test_SyncSharePrice : Script ()
+test_SyncSharePrice = script do
+  op <- allocateParty "Operator"
+  gov <- allocateParty "Governance"
+  reg <- setupCompliance op
+  mintSvc <- setupMintService op reg
+  pool <- setupPoolService op gov reg mintSvc
+
+  pool2 <- submitMulti [op, gov] [] do
+    exerciseCmd pool ETHPool_SyncSharePrice with
+      newSharePrice = 1.05  -- 5% increase (within ±10%)
+      epochNumber = 1
+      attestationHash = dummyHash
+      validatorCount = 3
+
+  r <- queryContractId op pool2
+  case r of
+    Some p -> assertMsg "price 1.05" (p.sharePrice == 1.05)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 15: SYNC SHARE PRICE — TOO LARGE FAILS
+-- ============================================================
+
+test_SyncSharePriceTooLarge : Script ()
+test_SyncSharePriceTooLarge = script do
+  op <- allocateParty "Operator"
+  gov <- allocateParty "Governance"
+  reg <- setupCompliance op
+  mintSvc <- setupMintService op reg
+  pool <- setupPoolService op gov reg mintSvc
+
+  -- 15% increase exceeds ±10% cap
+  submitMustFail op do
+    exerciseCmd pool ETHPool_SyncSharePrice with
+      newSharePrice = 1.15
+      epochNumber = 1
+      attestationHash = dummyHash
+      validatorCount = 3
+  pure ()
+
+-- ============================================================
+--         TEST 16: SYNC SHARE PRICE — NON-SEQUENTIAL EPOCH FAILS
+-- ============================================================
+
+test_SyncSharePriceNonSequentialFails : Script ()
+test_SyncSharePriceNonSequentialFails = script do
+  op <- allocateParty "Operator"
+  gov <- allocateParty "Governance"
+  reg <- setupCompliance op
+  mintSvc <- setupMintService op reg
+
+  pool <- submit op do
+    createCmd CantonETHPoolService with
+      operator = op; governance = gov
+      totalShares = 0.0; totalMusdStaked = 0.0
+      sharePrice = 1.0; poolCap = 10_000_000.0
+      lastSyncEpoch = 5; paused = False  -- epoch already at 5
+      directMintServiceCid = mintSvc
+      cantonCoinPrice = 2.0
+      complianceRegistryCid = reg
+      mpaHash = dummyHash; mpaUri = dummyUri
+      musdMintCap = 10_000_000.0
+      currentUnstakeMinted = 0.0
+      observers = []
+
+  -- epoch 3 is behind current 5
+  submitMustFail op do
+    exerciseCmd pool ETHPool_SyncSharePrice with
+      newSharePrice = 1.01
+      epochNumber = 3
+      attestationHash = dummyHash
+      validatorCount = 3
+  pure ()
+
+-- ============================================================
+--         TEST 17: UNSTAKE — WITH EXPIRED LOCK
+-- ============================================================
+
+test_UnstakeExpiredLock : Script ()
+test_UnstakeExpiredLock = script do
+  op <- allocateParty "Operator"
+  gov <- allocateParty "Governance"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  reg <- setupCompliance op
+  mintSvc <- setupMintService op reg
+
+  pool <- submit op do
+    createCmd CantonETHPoolService with
+      operator = op; governance = gov
+      totalShares = 1000.0; totalMusdStaked = 1000.0
+      sharePrice = 1.05; poolCap = 10_000_000.0
+      lastSyncEpoch = 1; paused = False
+      directMintServiceCid = mintSvc
+      cantonCoinPrice = 2.0
+      complianceRegistryCid = reg
+      mpaHash = dummyHash; mpaUri = dummyUri
+      musdMintCap = 10_000_000.0
+      currentUnstakeMinted = 0.0
+      observers = [alice]
+
+  -- smUSD-E with lock already expired
+  smusde <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 1000.0
+      entrySharePrice = 1.0; musdStaked = 1000.0
+      tier = ShortLock
+      stakedAt = addRelTime now (seconds (-3000000))  -- staked long ago
+      unlockAt = Some (addRelTime now (seconds (-1)))  -- already unlocked
+      privacyObservers = []
+
+  (newPool, musdCid) <- submitMulti [alice] [op] do
+    exerciseCmd pool ETHPool_Unstake with user = alice; smusdeCid = smusde
+
+  r <- queryContractId alice musdCid
+  case r of
+    Some m -> do
+      -- 1000 shares * 1.05 = 1050 mUSD
+      assertMsg "received 1050 mUSD" (m.amount == 1050.0)
+      assertMsg "alice owns" (m.owner == alice)
+    None -> abort "not found"
+  pure ()
+
+-- ============================================================
+--         TEST 18: UNSTAKE — LOCKED POSITION FAILS
+-- ============================================================
+
+test_UnstakeLockedFails : Script ()
+test_UnstakeLockedFails = script do
+  op <- allocateParty "Operator"
+  gov <- allocateParty "Governance"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  reg <- setupCompliance op
+  mintSvc <- setupMintService op reg
+
+  pool <- submit op do
+    createCmd CantonETHPoolService with
+      operator = op; governance = gov
+      totalShares = 1000.0; totalMusdStaked = 1000.0
+      sharePrice = 1.0; poolCap = 10_000_000.0
+      lastSyncEpoch = 1; paused = False
+      directMintServiceCid = mintSvc
+      cantonCoinPrice = 2.0
+      complianceRegistryCid = reg
+      mpaHash = dummyHash; mpaUri = dummyUri
+      musdMintCap = 10_000_000.0
+      currentUnstakeMinted = 0.0
+      observers = [alice]
+
+  -- smUSD-E with lock in the future
+  smusde <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 1000.0
+      entrySharePrice = 1.0; musdStaked = 1000.0
+      tier = LongLock
+      stakedAt = now
+      unlockAt = Some (addRelTime now (seconds 15552000))  -- 180 days from now
+      privacyObservers = []
+
+  submitMustFail alice do
+    exerciseCmd pool ETHPool_Unstake with user = alice; smusdeCid = smusde
+  pure ()
+
+-- ============================================================
+--         TEST 19: UNSTAKE — PAUSED FAILS
+-- ============================================================
+
+test_UnstakePausedFails : Script ()
+test_UnstakePausedFails = script do
+  op <- allocateParty "Operator"
+  gov <- allocateParty "Governance"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  reg <- setupCompliance op
+  mintSvc <- setupMintService op reg
+
+  pool <- submit op do
+    createCmd CantonETHPoolService with
+      operator = op; governance = gov
+      totalShares = 1000.0; totalMusdStaked = 1000.0
+      sharePrice = 1.0; poolCap = 10_000_000.0
+      lastSyncEpoch = 1; paused = True  -- PAUSED
+      directMintServiceCid = mintSvc
+      cantonCoinPrice = 2.0
+      complianceRegistryCid = reg
+      mpaHash = dummyHash; mpaUri = dummyUri
+      musdMintCap = 10_000_000.0
+      currentUnstakeMinted = 0.0
+      observers = [alice]
+
+  smusde <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 1000.0
+      entrySharePrice = 1.0; musdStaked = 1000.0
+      tier = NoLock; stakedAt = now; unlockAt = None
+      privacyObservers = []
+
+  submitMustFail alice do
+    exerciseCmd pool ETHPool_Unstake with user = alice; smusdeCid = smusde
+  pure ()
+
+-- ============================================================
+--         TEST 20: MERGE — PRESERVES LATEST UNLOCK TIME
+-- ============================================================
+
+test_SmUsdEMergePreservesLatestUnlock : Script ()
+test_SmUsdEMergePreservesLatestUnlock = script do
+  op <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  let early = addRelTime now (hours 24)
+  let later = addRelTime now (hours 48)
+
+  c1 <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 500.0
+      entrySharePrice = 1.0; musdStaked = 500.0
+      tier = ShortLock; stakedAt = now; unlockAt = Some early
+      privacyObservers = []
+
+  c2 <- submitMulti [op, alice] [] do
+    createCmd CantonSMUSD_E with
+      issuer = op; owner = alice; shares = 500.0
+      entrySharePrice = 1.0; musdStaked = 500.0
+      tier = ShortLock; stakedAt = now; unlockAt = Some later
+      privacyObservers = []
+
+  merged <- submit alice do
+    exerciseCmd c1 SMUSDE_Merge with otherCid = c2
+
+  r <- queryContractId alice merged
+  case r of
+    Some m -> assertMsg "latest unlock preserved" (m.unlockAt == Some later)
+    None -> abort "not found"
+  pure ()

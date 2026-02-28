@@ -1,0 +1,1025 @@
+-- | CantonLoopStrategyTest
+-- Tests for Canton-native loop strategy with governance, compliance, and lifecycle
+-- Coverage: config governance, compliance hooks, position lifecycle, unwind validation
+
+module CantonLoopStrategyTest where
+
+import Daml.Script
+import DA.Time
+import DA.Date
+import DA.Optional (fromSome, isSome)
+import DA.Set qualified as Set
+import CantonDirectMint (CantonUSDC(..), CantonMUSD(..), CantonMUSD_Burn(..), Money, Bps, BurnRateLimiter(..), USDCx(..))
+import CantonSMUSD (CantonSMUSD(..))
+import CantonCoinToken (CantonCoin(..))
+import CantonLoopStrategy
+import CantonLending (CantonLendingService(..), defaultCTNConfig)
+import Governance (GovernanceActionLog(..), ActionType(..))
+import Compliance
+
+-- ============================================================
+--                     TEST HELPERS
+-- ============================================================
+
+baseTime : Time
+baseTime = datetime 2026 Feb 6 12 0 0
+
+-- | Create a governance proof for tests
+createGovProof : Party -> Party -> ActionType -> Text -> Text -> Script (ContractId GovernanceActionLog)
+createGovProof operator governor actionType targetModule desc = do
+  now <- getTime
+  submit operator do
+    createCmd GovernanceActionLog with
+      operator
+      proposalId = "test-" <> desc
+      actionType
+      targetModule
+      description = desc
+      payload = ""
+      payloadHash = ""
+      approvers = [governor]
+      executedBy = governor
+      executedAt = now
+
+-- | Create a compliance registry
+createRegistry : Party -> Party -> Script (ContractId ComplianceRegistry)
+createRegistry regulator operator = do
+  now <- getTime
+  submit regulator do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.empty
+      frozen = Set.empty
+      lastUpdated = now
+
+-- | Standard test setup
+data LoopTestSetup = LoopTestSetup with
+  operator   : Party
+  user       : Party
+  regulator  : Party
+  governor   : Party
+  configCid  : ContractId CantonLoopStrategyConfig
+  registryCid : ContractId ComplianceRegistry
+
+setupLoopTest : Script LoopTestSetup
+setupLoopTest = do
+  operator <- allocateParty "Operator"
+  user <- allocateParty "User"
+  regulator <- allocateParty "Regulator"
+  governor <- allocateParty "Governor"
+  setTime baseTime
+
+  -- Create compliance registry
+  registryCid <- createRegistry regulator operator
+
+  -- Create governance-controlled config
+  configCid <- submit operator do
+    createCmd CantonLoopStrategyConfig with
+      operator
+      config = defaultLoopConfig
+      complianceRegistryCid = registryCid
+      observers = [user]
+
+  -- Create BurnRateLimiter for unwind burn paths
+  submit operator do
+    createCmd BurnRateLimiter with
+      operator
+      dailyBurnLimit = 1000000.0
+      dailyBurned = 0.0
+      lastResetTime = baseTime
+
+  return LoopTestSetup with ..
+
+-- | Create a USDC token for a user
+createUSDC : Party -> Party -> Money -> Script (ContractId CantonUSDC)
+createUSDC operator user amount = do
+  submitMulti [operator, user] [] do
+    createCmd CantonUSDC with
+      issuer = operator
+      owner = user
+      amount
+      privacyObservers = []
+
+-- | Create an sMUSD token for a user
+createSMUSD : Party -> Party -> Money -> Script (ContractId CantonSMUSD)
+createSMUSD operator user shares = do
+  regulator <- allocateParty "SmusdRegulator"
+  now <- getTime
+  tempComplianceCid <- submit regulator do
+    createCmd ComplianceRegistry with
+      regulator
+      operator
+      blacklisted = Set.empty
+      frozen = Set.empty
+      lastUpdated = now
+  submitMulti [operator, user] [] do
+    createCmd CantonSMUSD with
+      issuer = operator
+      owner = user
+      shares
+      entrySharePrice = 1.05
+      stakedAt = baseTime
+      complianceRegistryCid = tempComplianceCid
+      privacyObservers = []
+
+-- | Create a mUSD token
+createMUSD : Party -> Party -> Money -> Script (ContractId CantonMUSD)
+createMUSD operator owner amount = do
+  submitMulti [operator, owner] [] do
+    createCmd CantonMUSD with
+      issuer = operator
+      owner
+      amount
+      agreementHash = "a]1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6abc"
+      agreementUri = "https://minted.app/terms"
+      privacyObservers = []
+
+-- ============================================================
+--               1. CONFIG GOVERNANCE TESTS
+-- ============================================================
+
+testConfigCreation : Script ()
+testConfigCreation = do
+  setup <- setupLoopTest
+  -- Config should exist with default values
+  cfg <- queryContractId setup.operator setup.configCid
+  let c = (fromSome cfg).config
+  assertMsg "Max loops is 5" (c.maxLoops == 5)
+  assertMsg "Min HF is 11500" (c.minHealthFactorBps == 11500)
+  assertMsg "Target LTV is 9000" (c.targetLtvBps == 9000)
+  debug "✅ 1. Config creation with defaults"
+
+testConfigUpdateMaxLoops : Script ()
+testConfigUpdateMaxLoops = do
+  setup <- setupLoopTest
+  proof <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "update-max-loops"
+  newCfgCid <- submit setup.operator do
+    exerciseCmd setup.configCid LoopConfig_UpdateMaxLoops with
+      newMaxLoops = 8
+      governanceProofCid = proof
+  cfg <- queryContractId setup.operator newCfgCid
+  assertMsg "Max loops updated to 8" ((fromSome cfg).config.maxLoops == 8)
+  debug "✅ 2. Governance-gated max loops update"
+
+testConfigUpdateTargetLtv : Script ()
+testConfigUpdateTargetLtv = do
+  setup <- setupLoopTest
+  proof <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "update-ltv"
+  newCfgCid <- submit setup.operator do
+    exerciseCmd setup.configCid LoopConfig_UpdateTargetLtv with
+      newTargetLtvBps = 8500
+      governanceProofCid = proof
+  cfg <- queryContractId setup.operator newCfgCid
+  assertMsg "Target LTV updated to 8500" ((fromSome cfg).config.targetLtvBps == 8500)
+  debug "✅ 3. Governance-gated target LTV update"
+
+testConfigUpdateMinHealthFactor : Script ()
+testConfigUpdateMinHealthFactor = do
+  setup <- setupLoopTest
+  proof <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "update-hf"
+  newCfgCid <- submit setup.operator do
+    exerciseCmd setup.configCid LoopConfig_UpdateMinHealthFactor with
+      newMinHealthFactorBps = 15000
+      governanceProofCid = proof
+  cfg <- queryContractId setup.operator newCfgCid
+  assertMsg "Min HF updated to 15000" ((fromSome cfg).config.minHealthFactorBps == 15000)
+  debug "✅ 4. Governance-gated min health factor update"
+
+testConfigSetComplianceRegistry : Script ()
+testConfigSetComplianceRegistry = do
+  setup <- setupLoopTest
+  proof <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "set-registry"
+  -- Create a new registry to replace the existing one (field is now mandatory)
+  newRegCid <- createRegistry setup.regulator setup.operator
+  newCfgCid <- submit setup.operator do
+    exerciseCmd setup.configCid LoopConfig_SetComplianceRegistry with
+      newComplianceRegistryCid = newRegCid
+      governanceProofCid = proof
+  cfg <- queryContractId setup.operator newCfgCid
+  assertMsg "Registry updated" (isSome cfg)
+  debug "✅ 5. Governance-gated compliance registry update"
+
+-- | Reject config updates with wrong governance action type
+testConfigRejectWrongActionType : Script ()
+testConfigRejectWrongActionType = do
+  setup <- setupLoopTest
+  -- Use EmergencyPause proof for ParameterUpdate choice
+  wrongProof <- createGovProof setup.operator setup.governor EmergencyPause "CantonLoopStrategy" "wrong-type"
+  submitMustFail setup.operator do
+    exerciseCmd setup.configCid LoopConfig_UpdateMaxLoops with
+      newMaxLoops = 8
+      governanceProofCid = wrongProof
+  debug "✅ 6. Reject config update with wrong action type"
+
+-- | Reject unsafe parameter values
+testConfigRejectUnsafeValues : Script ()
+testConfigRejectUnsafeValues = do
+  setup <- setupLoopTest
+  -- Max loops > 10 should fail (hard safety ceiling)
+  proof1 <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "unsafe-loops"
+  submitMustFail setup.operator do
+    exerciseCmd setup.configCid LoopConfig_UpdateMaxLoops with
+      newMaxLoops = 15
+      governanceProofCid = proof1
+
+  -- Target LTV > 9500 should fail
+  proof2 <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "unsafe-ltv"
+  submitMustFail setup.operator do
+    exerciseCmd setup.configCid LoopConfig_UpdateTargetLtv with
+      newTargetLtvBps = 9900
+      governanceProofCid = proof2
+
+  -- Min HF < 11000 should fail
+  proof3 <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "unsafe-hf"
+  submitMustFail setup.operator do
+    exerciseCmd setup.configCid LoopConfig_UpdateMinHealthFactor with
+      newMinHealthFactorBps = 10000
+      governanceProofCid = proof3
+  debug "✅ 7. Reject unsafe config values (safety ceilings enforced)"
+
+-- ============================================================
+--               2. LOOP EXECUTION TESTS
+-- ============================================================
+
+testLoopRequestExecute : Script ()
+testLoopRequestExecute = do
+  setup <- setupLoopTest
+  usdcCid <- createUSDC setup.operator setup.user 1000.0
+
+  -- Create loop request
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_USDC
+      initialUsdcCid = Some usdcCid
+      initialUsdcxCid = None
+      initialCtnCid = None
+      initialAmount = 1000.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = setup.configCid
+
+  -- Operator executes
+  posCid <- submit setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+
+  pos <- queryContractId setup.operator posCid
+  let p = fromSome pos
+  assertMsg "Active status" (p.status == "active")
+  assertMsg "Deposited 1000" (p.totalDeposited == 1000.0)
+  assertMsg "0 loops completed" (p.loopsCompleted == 0)
+  debug "✅ 8. Loop request execute (with compliance check)"
+
+testLoopRequestRejectsBlacklisted : Script ()
+testLoopRequestRejectsBlacklisted = do
+  setup <- setupLoopTest
+  badUser <- allocateParty "BadUser"
+
+  -- Blacklist the user
+  newRegCid <- submit setup.regulator do
+    exerciseCmd setup.registryCid BlacklistUser with
+      userToBlock = badUser
+      reason = "OFAC sanctioned"
+
+  -- Update config with new registry
+  proof <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "update-reg"
+  newCfgCid <- submit setup.operator do
+    exerciseCmd setup.configCid LoopConfig_SetComplianceRegistry with
+      newComplianceRegistryCid = newRegCid
+      governanceProofCid = proof
+
+  usdcCid <- createUSDC setup.operator badUser 1000.0
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, badUser] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = badUser
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_USDC
+      initialUsdcCid = Some usdcCid
+      initialUsdcxCid = None
+      initialCtnCid = None
+      initialAmount = 1000.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = newCfgCid
+
+  -- Execute should fail due to compliance
+  submitMustFail setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+  debug "✅ 9. Blacklisted user rejected from loop execution"
+
+testLoopRequestCancel : Script ()
+testLoopRequestCancel = do
+  setup <- setupLoopTest
+  usdcCid <- createUSDC setup.operator setup.user 500.0
+
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_USDC
+      initialUsdcCid = Some usdcCid
+      initialUsdcxCid = None
+      initialCtnCid = None
+      initialAmount = 500.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = setup.configCid
+
+  -- User cancels
+  submit setup.user do
+    exerciseCmd reqCid LoopRequest_Cancel
+
+  debug "✅ 10. Loop request cancel (USDC retained)"
+
+-- ============================================================
+--               3. POSITION LIFECYCLE TESTS
+-- ============================================================
+
+testRecordLoop : Script ()
+testRecordLoop = do
+  setup <- setupLoopTest
+  usdcCid <- createUSDC setup.operator setup.user 1000.0
+
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_USDC
+      initialUsdcCid = Some usdcCid
+      initialUsdcxCid = None
+      initialCtnCid = None
+      initialAmount = 1000.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = setup.configCid
+
+  posCid <- submit setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+
+  -- Record a loop iteration
+  -- HF check: (900 * 0.93) / 700 = 1.196 ≥ 1.15 ✓
+  smusdCid <- createSMUSD setup.operator setup.user 900.0
+  posCid2 <- submit setup.operator do
+    exerciseCmd posCid LoopPosition_RecordLoop with
+      musdMinted = 900.0
+      musdStaked = 900.0
+      musdBorrowed = 700.0
+      newSmusdCid = smusdCid
+      newLeverage = 1.9
+
+  pos <- queryContractId setup.operator posCid2
+  let p = fromSome pos
+  assertMsg "1 loop completed" (p.loopsCompleted == 1)
+  assertMsg "Staked 900" (p.totalStaked == 900.0)
+  assertMsg "Borrowed 700" (p.totalBorrowed == 700.0)
+  assertMsg "Leverage 1.9" (p.leverageMultiplier == 1.9)
+  debug "✅ 11. Record loop iteration"
+
+testRecordLoopMaxReached : Script ()
+testRecordLoopMaxReached = do
+  setup <- setupLoopTest
+  -- Create config with maxLoops = 1
+  proof <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "single-loop"
+  newCfgCid <- submit setup.operator do
+    exerciseCmd setup.configCid LoopConfig_UpdateMaxLoops with
+      newMaxLoops = 1
+      governanceProofCid = proof
+
+  -- Create request with maxLoops = 1
+  let singleLoopConfig = defaultLoopConfig with maxLoops = 1
+  usdcCid <- createUSDC setup.operator setup.user 1000.0
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = singleLoopConfig
+      depositType = LoopDeposit_USDC
+      initialUsdcCid = Some usdcCid
+      initialUsdcxCid = None
+      initialCtnCid = None
+      initialAmount = 1000.0
+      requestedLoops = 1
+      requestedAt = now
+      configCid = newCfgCid
+
+  posCid <- submit setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+
+  -- First loop should succeed
+  -- HF check: (900 * 0.93) / 700 = 1.196 ≥ 1.15 ✓
+  smusdCid <- createSMUSD setup.operator setup.user 900.0
+  posCid2 <- submit setup.operator do
+    exerciseCmd posCid LoopPosition_RecordLoop with
+      musdMinted = 900.0
+      musdStaked = 900.0
+      musdBorrowed = 700.0
+      newSmusdCid = smusdCid
+      newLeverage = 1.9
+
+  -- Second loop should fail (max reached)
+  smusdCid2 <- createSMUSD setup.operator setup.user 600.0
+  submitMustFail setup.operator do
+    exerciseCmd posCid2 LoopPosition_RecordLoop with
+      musdMinted = 600.0
+      musdStaked = 600.0
+      musdBorrowed = 500.0
+      newSmusdCid = smusdCid2
+      newLeverage = 2.5
+  debug "✅ 12. Max loop count enforced"
+
+-- ============================================================
+--               4. UNWIND LIFECYCLE TESTS
+-- ============================================================
+
+testUnwindLifecycle : Script ()
+testUnwindLifecycle = do
+  setup <- setupLoopTest
+  usdcCid <- createUSDC setup.operator setup.user 1000.0
+
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_USDC
+      initialUsdcCid = Some usdcCid
+      initialUsdcxCid = None
+      initialCtnCid = None
+      initialAmount = 1000.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = setup.configCid
+
+  posCid <- submit setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+
+  -- Record one loop (HF: (900*0.93)/700 = 1.196 ≥ 1.15)
+  smusdCid1 <- createSMUSD setup.operator setup.user 900.0
+  posCid2 <- submit setup.operator do
+    exerciseCmd posCid LoopPosition_RecordLoop with
+      musdMinted = 900.0
+      musdStaked = 900.0
+      musdBorrowed = 700.0
+      newSmusdCid = smusdCid1
+      newLeverage = 1.9
+
+  -- User initiates unwind
+  (unwindingPosCid, unwindReqCid) <- submit setup.user do
+    exerciseCmd posCid2 LoopPosition_Unwind
+
+  -- Verify status changed to "unwinding"
+  uwPos <- queryContractId setup.operator unwindingPosCid
+  assertMsg "Status is unwinding" ((fromSome uwPos).status == "unwinding")
+
+  -- Execute unwind: create new sMUSD + mUSD to archive/burn
+  smusdToArchive <- createSMUSD setup.operator setup.user 900.0
+  musdToBurn <- createMUSD setup.operator setup.operator 700.0
+
+  usdcBack <- submit setup.operator do
+    exerciseCmd unwindReqCid UnwindRequest_Execute with
+      usdcReturned = 950.0
+      smusdToArchive = [smusdToArchive]
+      musdToBurn = Some musdToBurn
+      configCid = setup.configCid
+
+  -- Verify USDC returned
+  usdc <- queryContractId setup.operator usdcBack
+  assertMsg "Got 950 USDC back" ((fromSome usdc).amount == 950.0)
+  assertMsg "User owns USDC" ((fromSome usdc).owner == setup.user)
+  debug "✅ 13. Full unwind lifecycle: active → unwinding → closed"
+
+testUnwindRejectDoubleUnwind : Script ()
+testUnwindRejectDoubleUnwind = do
+  setup <- setupLoopTest
+  usdcCid <- createUSDC setup.operator setup.user 1000.0
+
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_USDC
+      initialUsdcCid = Some usdcCid
+      initialUsdcxCid = None
+      initialCtnCid = None
+      initialAmount = 1000.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = setup.configCid
+
+  posCid <- submit setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+
+  -- First unwind succeeds
+  (unwindingPosCid, _) <- submit setup.user do
+    exerciseCmd posCid LoopPosition_Unwind
+
+  -- Second unwind on same position should fail ("unwinding" → can't unwind again)
+  submitMustFail setup.user do
+    exerciseCmd unwindingPosCid LoopPosition_Unwind
+  debug "✅ 14. Double unwind rejected"
+
+testUnwindCancel : Script ()
+testUnwindCancel = do
+  setup <- setupLoopTest
+  usdcCid <- createUSDC setup.operator setup.user 1000.0
+
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_USDC
+      initialUsdcCid = Some usdcCid
+      initialUsdcxCid = None
+      initialCtnCid = None
+      initialAmount = 1000.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = setup.configCid
+
+  posCid <- submit setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+
+  -- Unwind
+  (unwindingPosCid, unwindReqCid) <- submit setup.user do
+    exerciseCmd posCid LoopPosition_Unwind
+
+  -- Cancel unwind → position returns to active
+  reactivatedCid <- submit setup.user do
+    exerciseCmd unwindReqCid UnwindRequest_Cancel
+
+  pos <- queryContractId setup.operator reactivatedCid
+  assertMsg "Status reverted to active" ((fromSome pos).status == "active")
+  debug "✅ 15. Unwind cancel reverts to active"
+
+-- ============================================================
+--               5. UNWIND VALIDATION TESTS
+-- ============================================================
+
+testUnwindSmusdCountMismatch : Script ()
+testUnwindSmusdCountMismatch = do
+  setup <- setupLoopTest
+  usdcCid <- createUSDC setup.operator setup.user 1000.0
+
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_USDC
+      initialUsdcCid = Some usdcCid
+      initialUsdcxCid = None
+      initialCtnCid = None
+      initialAmount = 1000.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = setup.configCid
+
+  posCid <- submit setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+
+  -- Record 2 loops → 2 sMUSD CIDs in position
+  -- Loop 1: HF = (900*0.93)/700 = 1.196 ≥ 1.15
+  smusdCid1 <- createSMUSD setup.operator setup.user 900.0
+  posCid2 <- submit setup.operator do
+    exerciseCmd posCid LoopPosition_RecordLoop with
+      musdMinted = 900.0
+      musdStaked = 900.0
+      musdBorrowed = 700.0
+      newSmusdCid = smusdCid1
+      newLeverage = 1.7
+
+  -- Loop 2: HF = ((900+600)*0.93)/(700+400) = 1395/1100 = 1.268 ≥ 1.15
+  smusdCid2 <- createSMUSD setup.operator setup.user 600.0
+  posCid3 <- submit setup.operator do
+    exerciseCmd posCid2 LoopPosition_RecordLoop with
+      musdMinted = 600.0
+      musdStaked = 600.0
+      musdBorrowed = 400.0
+      newSmusdCid = smusdCid2
+      newLeverage = 2.1
+
+  -- Unwind
+  (_, unwindReqCid) <- submit setup.user do
+    exerciseCmd posCid3 LoopPosition_Unwind
+
+  -- Try to unwind with only 1 sMUSD (position has 2) → should fail
+  smusdToArchive <- createSMUSD setup.operator setup.user 900.0
+  musdToBurn <- createMUSD setup.operator setup.operator 1100.0
+  submitMustFail setup.operator do
+    exerciseCmd unwindReqCid UnwindRequest_Execute with
+      usdcReturned = 500.0
+      smusdToArchive = [smusdToArchive]  -- Only 1, needs 2
+      musdToBurn = Some musdToBurn
+      configCid = setup.configCid
+  debug "✅ 16. sMUSD count mismatch rejected on unwind"
+
+testUnwindRequiresMusdBurnWhenDebt : Script ()
+testUnwindRequiresMusdBurnWhenDebt = do
+  setup <- setupLoopTest
+  usdcCid <- createUSDC setup.operator setup.user 1000.0
+
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_USDC
+      initialUsdcCid = Some usdcCid
+      initialUsdcxCid = None
+      initialCtnCid = None
+      initialAmount = 1000.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = setup.configCid
+
+  posCid <- submit setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+
+  -- Record a loop (creates debt) — HF: (900*0.93)/700 = 1.196 ≥ 1.15
+  smusdCid1 <- createSMUSD setup.operator setup.user 900.0
+  posCid2 <- submit setup.operator do
+    exerciseCmd posCid LoopPosition_RecordLoop with
+      musdMinted = 900.0
+      musdStaked = 900.0
+      musdBorrowed = 700.0
+      newSmusdCid = smusdCid1
+      newLeverage = 1.9
+
+  (_, unwindReqCid) <- submit setup.user do
+    exerciseCmd posCid2 LoopPosition_Unwind
+
+  -- Try to unwind without mUSD burn (but debt > 0) → should fail
+  smusdToArchive <- createSMUSD setup.operator setup.user 900.0
+  submitMustFail setup.operator do
+    exerciseCmd unwindReqCid UnwindRequest_Execute with
+      usdcReturned = 500.0
+      smusdToArchive = [smusdToArchive]
+      musdToBurn = None  -- No mUSD burn, but 700 debt exists
+      configCid = setup.configCid
+  debug "✅ 17. Missing mUSD burn rejected when debt exists"
+
+testUnwindMinReturnFloor : Script ()
+testUnwindMinReturnFloor = do
+  setup <- setupLoopTest
+  usdcCid <- createUSDC setup.operator setup.user 1000.0
+
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_USDC
+      initialUsdcCid = Some usdcCid
+      initialUsdcxCid = None
+      initialCtnCid = None
+      initialAmount = 1000.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = setup.configCid
+
+  posCid <- submit setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+
+  -- Unwind with no loops (no sMUSD, no debt)
+  (_, unwindReqCid) <- submit setup.user do
+    exerciseCmd posCid LoopPosition_Unwind
+
+  -- Try to return only 50 USDC on 1000 deposit → below 10% floor (100)
+  submitMustFail setup.operator do
+    exerciseCmd unwindReqCid UnwindRequest_Execute with
+      usdcReturned = 50.0
+      smusdToArchive = []
+      musdToBurn = None
+      configCid = setup.configCid
+  debug "✅ 18. Return below minimum floor rejected"
+
+-- ============================================================
+--               6. LEVERAGE CALCULATOR TESTS
+-- ============================================================
+
+testLeverageCalculation : Script ()
+testLeverageCalculation = do
+  -- 5 loops at 90% LTV → leverage ≈ 4.0951
+  let lev = calculateLeverage 0.9 5
+  assertMsg "Leverage for 5 loops at 90% LTV" (lev > 4.0 && lev < 4.1)
+
+  -- 3 loops at 90% LTV → leverage ≈ 2.71
+  let lev3 = calculateLeverage 0.9 3
+  assertMsg "Leverage for 3 loops at 90% LTV" (lev3 > 2.7 && lev3 < 2.72)
+
+  -- 1 loop → leverage = 1.0
+  let lev1 = calculateLeverage 0.9 1
+  assertMsg "Leverage for 1 loop is 1.0" (lev1 == 1.0)
+  debug "✅ 19. Leverage calculations"
+
+testNetAPYCalculation : Script ()
+testNetAPYCalculation = do
+  let netAPY = calculateNetAPY 0.06 0.04 5.0
+  -- 6% * 5 - 4% * 4 = 30% - 16% = 14%
+  assertMsg "Net APY is 14%" (netAPY == 0.14)
+  debug "✅ 20. Net APY calculation"
+
+testHealthFactorCalculation : Script ()
+testHealthFactorCalculation = do
+  -- $1000 staked, 93% threshold, $900 debt
+  let hf = calculateHealthFactor 1000.0 9300 900.0
+  -- (1000 * 0.93) / 900 = 930 / 900 ≈ 1.0333
+  assertMsg "Health factor > 1" (hf > 1.0)
+
+  -- No debt → health factor = 999.0
+  let hfNone = calculateHealthFactor 1000.0 9300 0.0
+  assertMsg "No debt health factor" (hfNone == 999.0)
+  debug "✅ 21. Health factor calculations"
+
+testStrategyEstimate : Script ()
+testStrategyEstimate = do
+  let est = estimateStrategy SMUSDMaxiLoop defaultLoopConfig LoopDeposit_USDC 1000.0 5 0.06 0.04
+  assertMsg "Leverage > 4" (est.leverage > 4.0)
+  assertMsg "Net APY positive" (est.netAPY > 0.0)
+  assertMsg "Health factor > 1" (est.healthFactor > 1.0)
+  debug "✅ 22. Strategy estimate"
+
+-- ============================================================
+--               7. COMPLIANCE ON UNWIND TESTS
+-- ============================================================
+
+testUnwindRejectsBlacklistedUser : Script ()
+testUnwindRejectsBlacklistedUser = do
+  setup <- setupLoopTest
+  usdcCid <- createUSDC setup.operator setup.user 1000.0
+
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_USDC
+      initialUsdcCid = Some usdcCid
+      initialUsdcxCid = None
+      initialCtnCid = None
+      initialAmount = 1000.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = setup.configCid
+
+  posCid <- submit setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+
+  -- Now blacklist the user
+  newRegCid <- submit setup.regulator do
+    exerciseCmd setup.registryCid BlacklistUser with
+      userToBlock = setup.user
+      reason = "Suspicious activity"
+
+  -- Update config with new registry
+  proof <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "bl-reg"
+  newCfgCid <- submit setup.operator do
+    exerciseCmd setup.configCid LoopConfig_SetComplianceRegistry with
+      newComplianceRegistryCid = newRegCid
+      governanceProofCid = proof
+
+  -- Unwind
+  (_, unwindReqCid) <- submit setup.user do
+    exerciseCmd posCid LoopPosition_Unwind
+
+  -- Execute unwind should fail (user blacklisted)
+  submitMustFail setup.operator do
+    exerciseCmd unwindReqCid UnwindRequest_Execute with
+      usdcReturned = 950.0
+      smusdToArchive = []
+      musdToBurn = None
+      configCid = newCfgCid
+  debug "✅ 23. Blacklisted user rejected on unwind"
+
+-- ============================================================
+--               8. MULTI-ASSET DEPOSIT TESTS
+-- ============================================================
+
+-- | Create a USDCx token for a user
+createUSDCx : Party -> Party -> Money -> Script (ContractId USDCx)
+createUSDCx operator user amount = do
+  submitMulti [operator, user] [] do
+    createCmd USDCx with
+      issuer = operator
+      owner = user
+      amount
+      sourceChain = "ethereum"
+      cctpNonce = 1
+      privacyObservers = []
+
+-- | Create a CantonCoin token for a user
+createCTN : Party -> Party -> Money -> Script (ContractId CantonCoin)
+createCTN operator user amount = do
+  submitMulti [operator, user] [] do
+    createCmd CantonCoin with
+      issuer = operator
+      owner = user
+      amount
+      privacyObservers = []
+
+testLoopRequestUsdcxDeposit : Script ()
+testLoopRequestUsdcxDeposit = do
+  setup <- setupLoopTest
+  usdcxCid <- createUSDCx setup.operator setup.user 1000.0
+
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_USDCx
+      initialUsdcCid = None
+      initialUsdcxCid = Some usdcxCid
+      initialCtnCid = None
+      initialAmount = 1000.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = setup.configCid
+
+  -- Operator executes
+  posCid <- submit setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+
+  pos <- queryContractId setup.operator posCid
+  let p = fromSome pos
+  assertMsg "Active status" (p.status == "active")
+  assertMsg "Deposited 1000" (p.totalDeposited == 1000.0)
+  assertMsg "Deposit type is USDCx" (p.depositType == LoopDeposit_USDCx)
+  debug "✅ 24. USDCx deposit loop request execute"
+
+testLoopRequestCtnDeposit : Script ()
+testLoopRequestCtnDeposit = do
+  setup <- setupLoopTest
+  ctnCid <- createCTN setup.operator setup.user 500.0
+
+  now <- getTime
+  reqCid <- submitMulti [setup.operator, setup.user] [] do
+    createCmd CantonLoopRequest with
+      operator = setup.operator
+      user = setup.user
+      strategy = SMUSDMaxiLoop
+      config = defaultLoopConfig
+      depositType = LoopDeposit_CTN
+      initialUsdcCid = None
+      initialUsdcxCid = None
+      initialCtnCid = Some ctnCid
+      initialAmount = 500.0
+      requestedLoops = 3
+      requestedAt = now
+      configCid = setup.configCid
+
+  -- Operator executes
+  posCid <- submit setup.operator do
+    exerciseCmd reqCid LoopRequest_Execute
+
+  pos <- queryContractId setup.operator posCid
+  let p = fromSome pos
+  assertMsg "Active status" (p.status == "active")
+  assertMsg "Deposited 500" (p.totalDeposited == 500.0)
+  assertMsg "Deposit type is CTN" (p.depositType == LoopDeposit_CTN)
+  debug "✅ 25. CantonCoin deposit loop request execute"
+
+-- ============================================================
+--               9. CTN LTV GOVERNANCE TEST
+-- ============================================================
+
+testConfigUpdateCtnTargetLtv : Script ()
+testConfigUpdateCtnTargetLtv = do
+  setup <- setupLoopTest
+  proof <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "update-ctn-ltv"
+  newCfgCid <- submit setup.operator do
+    exerciseCmd setup.configCid LoopConfig_UpdateCtnTargetLtv with
+      newCtnTargetLtvBps = 5000
+      governanceProofCid = proof
+  cfg <- queryContractId setup.operator newCfgCid
+  assertMsg "CTN target LTV updated to 5000" ((fromSome cfg).config.ctnTargetLtvBps == 5000)
+
+  -- Reject out-of-range CTN LTV (> 7500)
+  proof2 <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "unsafe-ctn-ltv"
+  submitMustFail setup.operator do
+    exerciseCmd newCfgCid LoopConfig_UpdateCtnTargetLtv with
+      newCtnTargetLtvBps = 8000
+      governanceProofCid = proof2
+
+  -- Reject out-of-range CTN LTV (< 3000)
+  proof3 <- createGovProof setup.operator setup.governor ParameterUpdate "CantonLoopStrategy" "low-ctn-ltv"
+  submitMustFail setup.operator do
+    exerciseCmd newCfgCid LoopConfig_UpdateCtnTargetLtv with
+      newCtnTargetLtvBps = 2000
+      governanceProofCid = proof3
+  debug "✅ 26. Governance-gated CTN target LTV update with safety bounds"
+
+
+-- ============================================================
+--         27. LOOP STRATEGY SERVICE CREATION & ADMIN
+-- ============================================================
+
+-- | CantonLoopStrategyService creation, pause, param update, fee withdrawal
+testLoopServiceAdmin : Script ()
+testLoopServiceAdmin = do
+  setup <- setupLoopTest
+  -- Create a lending service (required by CantonLoopStrategyService)
+  lendingCid <- submit setup.operator do
+    createCmd CantonLendingService with
+      operator = setup.operator
+      configs = [defaultCTNConfig]
+      totalBorrows = 0.0
+      interestRateBps = 500
+      reserveFactorBps = 1000
+      protocolReserves = 0.0
+      minBorrow = 10.0
+      closeFactorBps = 5000
+      paused = False
+      cantonSupplyCap = 10000000.0
+      cantonCurrentSupply = 0.0
+      globalMintCap = 50000000.0
+      complianceRegistryCid = setup.registryCid
+      mpaHash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+      mpaUri = "https://minted.app/terms"
+      serviceName = "lending"
+      observers = [setup.user]
+
+  -- Create CantonLoopStrategyService
+  svcCid <- submit setup.operator do
+    createCmd CantonLoopStrategyService with
+      operator = setup.operator
+      maxLoops = 10
+      maxLeverageX10 = 30
+      minBorrowPerLoop = 100.0
+      totalPositions = 0
+      totalCollateralLocked = 0.0
+      totalDebtIssued = 0.0
+      entryFeeBps = 25
+      exitFeeBps = 50
+      protocolFeesAccrued = 0.0
+      paused = False
+      complianceRegistryCid = setup.registryCid
+      lendingServiceCid = lendingCid
+      serviceName = "CantonLoopStrategy"
+      observers = [setup.user]
+
+  -- Pause the service
+  svcCid2 <- submit setup.operator do
+    exerciseCmd svcCid Loop_SetPaused with newPaused = True
+
+  svc <- queryContractId setup.operator svcCid2
+  assertMsg "Service paused" ((fromSome svc).paused)
+
+  -- Unpause
+  svcCid3 <- submit setup.operator do
+    exerciseCmd svcCid2 Loop_SetPaused with newPaused = False
+
+  -- Update params
+  svcCid4 <- submit setup.operator do
+    exerciseCmd svcCid3 Loop_UpdateParams with
+      newMaxLoops = 5
+      newMaxLeverageX10 = 20
+      newMinBorrowPerLoop = 200.0
+
+  svc2 <- queryContractId setup.operator svcCid4
+  assertMsg "Max loops updated" ((fromSome svc2).maxLoops == 5)
+  assertMsg "Max leverage updated" ((fromSome svc2).maxLeverageX10 == 20)
+  assertMsg "Min borrow updated" ((fromSome svc2).minBorrowPerLoop == 200.0)
+
+  -- Add some fees manually (simulate accumulated fees via create)
+  svcCid5 <- submit setup.operator do
+    exerciseCmd svcCid4 Loop_SetPaused with newPaused = False
+  -- The service has 0 fees accrued; withdraw should fail
+  submitMustFail setup.operator do
+    exerciseCmd svcCid5 Loop_WithdrawFees with amount = 100.0
+
+  debug "✅ 27. CantonLoopStrategyService created and admin choices exercised"

@@ -1,0 +1,127 @@
+-- | CantonCoinMint
+-- Wrapper module that orchestrates CantonCoin → USDCx swap → mUSD mint.
+-- Breaks the cyclic dependency: CantonCoinToken ← CantonDirectMint.
+-- This module imports both and provides the end-to-end flow:
+--   1. User deposits CantonCoin
+--   2. Coin is burned (operator absorbs coin asset off-ledger)
+--   3. Operator provides USDCx equal to coin's USD value at oracle price
+--   4. USDCx is transferred to user
+--   5. User mints mUSD via DirectMint_MintWithUSDCx (emits BridgeOutRequest!)
+--
+-- This ensures proper USDC backing flows to Ethereum Treasury automatically
+-- via the relay's processCantonBridgeOuts(). No manual operator intervention needed.
+--
+-- Usage: User exercises MintMusdWithCoin on the CoinMintService.
+--        Operator must maintain a USDCx pool for coin-to-mUSD swaps.
+
+module CantonCoinMint where
+
+import CantonDirectMint
+  ( CantonDirectMintService(..)
+  , DirectMint_MintWithUSDCx(..)
+  , CantonMUSD, Money
+  , USDCx(..), USDCx_Split(..), USDCx_Transfer(..)
+  , USDCxTransferProposal(..), USDCxTransferProposal_Accept(..)
+  , BridgeOutRequest
+  )
+import CantonCoinToken (CantonCoin(..), CantonCoin_Burn(..))
+import Compliance (ComplianceRegistry(..), ValidateMint(..))
+
+-- | Service that wraps CantonCoin → USDCx swap → mUSD mint.
+-- The operator deploys this alongside DirectMintService and maintains a USDCx pool.
+-- When a user mints with coin, the operator provides USDCx in return for the coin,
+-- then the USDCx flows through the standard minting pipeline (with BridgeOutRequest).
+template CoinMintService
+  with
+    operator : Party
+    cantonCoinPrice : Money       -- USD per Canton coin (oracle-set)
+    directMintServiceCid : ContractId CantonDirectMintService
+    complianceRegistryCid : ContractId ComplianceRegistry
+    observers : [Party]
+  where
+    signatory operator
+    observer observers
+
+    ensure cantonCoinPrice > 0.0
+
+    -- | User deposits CantonCoin → operator swaps USDCx at oracle price → mints mUSD.
+    -- The coin is burned, operator's USDCx is transferred to user, then the user
+    -- mints via DirectMint_MintWithUSDCx which emits a BridgeOutRequest so the
+    -- relay auto-deposits USDC into Ethereum Treasury. No backing gap.
+    --
+    -- Authorization chain:
+    --   operator (signatory) → authorizes USDCx_Split, USDCx_Transfer, CantonCoin_Burn
+    --   user (controller)    → authorizes USDCxTransferProposal_Accept, DirectMint_MintWithUSDCx
+    choice MintMusdWithCoin : (ContractId CoinMintService, ContractId CantonDirectMintService, ContractId CantonMUSD, ContractId BridgeOutRequest)
+      with
+        user : Party
+        coinCid : ContractId CantonCoin
+        operatorUsdcxCid : ContractId USDCx  -- Operator's USDCx to swap for coin
+      controller user
+      do
+        -- Validate coin ownership
+        coin <- fetch coinCid
+        assertMsg "COIN_OWNER_MISMATCH" (coin.owner == user)
+
+        -- Compliance check
+        exercise complianceRegistryCid ValidateMint with minter = user
+
+        -- Calculate coin's USD value at oracle price
+        let coinUsdValue = coin.amount * cantonCoinPrice
+        assertMsg "ZERO_COIN_VALUE" (coinUsdValue > 0.0)
+
+        -- Validate operator's USDCx covers the coin value
+        usdcx <- fetch operatorUsdcxCid
+        assertMsg "USDCX_OWNER_MISMATCH" (usdcx.owner == operator)
+        assertMsg "USDCX_INSUFFICIENT" (usdcx.amount >= coinUsdValue)
+
+        -- Burn the Canton coin (operator absorbs coin asset off-ledger)
+        exercise coinCid CantonCoin_Burn
+
+        -- Swap: transfer operator's USDCx to user (split if larger than coin value)
+        userUsdcxCid <- if usdcx.amount == coinUsdValue
+          then do
+            -- Exact match: transfer whole USDCx to user
+            proposal <- exercise operatorUsdcxCid USDCx_Transfer with
+              newOwner = user
+              complianceRegistryCid
+            exercise proposal USDCxTransferProposal_Accept with complianceRegistryCid
+          else do
+            -- Split: user gets coinValue portion, operator keeps remainder
+            (userPortion, _remainder) <- exercise operatorUsdcxCid USDCx_Split with
+              splitAmount = coinUsdValue
+            proposal <- exercise userPortion USDCx_Transfer with
+              newOwner = user
+              complianceRegistryCid
+            exercise proposal USDCxTransferProposal_Accept with complianceRegistryCid
+
+        -- Mint mUSD via USDCx path — this emits a BridgeOutRequest for proper backing!
+        (newDmSvc, musdCid, bridgeReq) <- exercise directMintServiceCid DirectMint_MintWithUSDCx with
+          user
+          usdcxCid = userUsdcxCid
+
+        -- Update service with new DirectMint reference
+        newSvc <- create this with
+          directMintServiceCid = newDmSvc
+
+        return (newSvc, newDmSvc, musdCid, bridgeReq)
+
+    -- | Update Canton coin oracle price (governance-cosigned)
+    choice CoinMint_SetPrice : ContractId CoinMintService
+      with
+        newPrice : Money
+      controller operator
+      do
+        assertMsg "PRICE_POSITIVE" (newPrice > 0.0)
+        -- Cap price changes at ±25% per update (same as ETHPool)
+        let maxPrice = cantonCoinPrice * 1.25
+        let minPrice = cantonCoinPrice * 0.75
+        assertMsg "PRICE_CHANGE_TOO_LARGE" (newPrice <= maxPrice && newPrice >= minPrice)
+        create this with cantonCoinPrice = newPrice
+
+    -- | Update DirectMint service reference
+    choice CoinMint_SetDirectMintService : ContractId CoinMintService
+      with
+        newServiceCid : ContractId CantonDirectMintService
+      controller operator
+      do create this with directMintServiceCid = newServiceCid

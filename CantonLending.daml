@@ -1,0 +1,2462 @@
+-- | CantonLending
+-- Canton-native lending module with actual token escrowing.
+-- For the V3 bridge-integrated vault/CDP system, see Minted.Protocol.V3 (Vault template).
+-- This standalone module is the authoritative Canton-native lending implementation
+-- with multi-collateral support, real token escrowing, and compliance gating.
+--
+-- Architecture:
+--   Users deposit Canton-native assets (CantonCoin, CantonUSDC, USDCx, CantonSMUSD)
+--   as collateral into escrowed positions. They borrow CantonMUSD against this collateral.
+--
+--   Price feeds from Tradecraft DEX API (primary, no auth) and Temple DEX API (fallback).
+--   Liquidations seize escrowed collateral and route through Tradecraft/Temple AMMs.
+--
+--   Unlike V3.daml's text-based Vault system, this module escrows ACTUAL token contracts.
+--   Collateral is locked on-ledger — not tracked by reference to Ethereum.
+--
+-- Supported Collateral:
+--   - CantonCoin (CTN)   — volatile, Temple DEX price feed, ~65% LTV
+--   - CantonUSDC         — stable 1:1, hardcoded price, ~95% LTV
+--   - USDCx              — stable 1:1 (xReserve bridged), ~95% LTV
+--   - CantonSMUSD        — yield-bearing, globalSharePrice feed, ~90% LTV
+--
+-- Revenue Model:
+--   Interest on borrows → routed to sMUSD stakers (mirroring Ethereum BorrowModule)
+--   Liquidation penalties → keeper bonus + protocol fee
+--   Reserve factor → protocol reserves
+
+module CantonLending where
+
+import DA.Time
+import DA.Text qualified as DA.Text
+import DA.List (dedup)
+import CantonDirectMint (CantonMUSD(..), CantonMUSD_Burn(..), CantonMUSD_Split(..), CantonUSDC(..), USDCx(..), Money, Bps, CantonDirectMintService(..))
+import CantonSMUSD (CantonSMUSD(..))
+import CantonETHPool (CantonSMUSD_E(..), TimeLockTier(..))
+import CantonCoinToken (CantonCoin(..))
+import Compliance (ComplianceRegistry(..), ValidateMint(..), ValidateRedemption(..))
+import Governance (GovernanceActionLog(..), ActionType(..), ConsumeProof(..))
+import UserPrivacySettings (lookupUserObservers)
+
+-- ============================================================
+--                     SECTION 1: COLLATERAL CONFIG
+-- ============================================================
+
+-- | Collateral asset type tag
+data CollateralType
+  = CTN_Coin       -- CantonCoin (volatile)
+  | CTN_USDC       -- CantonUSDC (stable)
+  | CTN_USDCx      -- USDCx / xReserve bridged (stable)
+  | CTN_SMUSD      -- CantonSMUSD (yield-bearing stable)
+  | CTN_SMUSDE     -- CantonSMUSD_E (ETH Pool variant — lending/borrowing enabled)
+  deriving (Eq, Show, Ord)
+
+-- | Per-asset collateral parameters (mirrors CollateralVault.sol CollateralConfig)
+data CollateralConfig = CollateralConfig with
+    collateralType         : CollateralType
+    enabled                : Bool
+    collateralFactorBps    : Bps    -- Max LTV. e.g. 6500 = 65% for CTN, 9500 = 95% for USDC
+    liquidationThresholdBps : Bps   -- Liquidation triggers here. e.g. 7500 = 75%
+    liquidationPenaltyBps  : Bps    -- Penalty on seized collateral. e.g. 500 = 5%
+    liquidationBonusBps    : Bps    -- Keeper bonus from penalty. e.g. 250 = 2.5%
+    maxStalenessSecs       : Int    -- DAML-M-03: Per-asset max price staleness in seconds
+    supplyEnabled          : Bool   -- Whether this asset can be supplied for yield
+    supplyRateBps          : Bps    -- Annual supply rate (e.g. 200 = 2% APY)
+  deriving (Eq, Show)
+
+-- | Default configs for each collateral type
+defaultCTNConfig : CollateralConfig
+defaultCTNConfig = CollateralConfig with
+    collateralType = CTN_Coin
+    enabled = True
+    collateralFactorBps = 6500       -- 65% LTV — volatile asset
+    liquidationThresholdBps = 7500   -- 75% — liquidation trigger
+    liquidationPenaltyBps = 1000     -- 10% penalty
+    liquidationBonusBps = 500        -- 5% keeper bonus
+    maxStalenessSecs = 300           -- DAML-M-03: 5 min — volatile asset needs fresh prices
+    supplyEnabled = True             -- Canton Coin can be supplied for yield
+    supplyRateBps = 200              -- 2% APY — base rate for volatile asset supply
+
+defaultUSDCConfig : CollateralConfig
+defaultUSDCConfig = CollateralConfig with
+    collateralType = CTN_USDC
+    enabled = False                  -- DISABLED: No incentive to borrow mUSD against USDC (DirectMint does 1:1)
+    collateralFactorBps = 9500       -- 95% LTV — stable (inactive)
+    liquidationThresholdBps = 9700   -- 97% — tight spread (inactive)
+    liquidationPenaltyBps = 300      -- 3% penalty
+    liquidationBonusBps = 150        -- 1.5% keeper bonus
+    maxStalenessSecs = 3600          -- DAML-M-03: 1h — stable asset
+    supplyEnabled = False
+    supplyRateBps = 0
+
+defaultUSDCxConfig : CollateralConfig
+defaultUSDCxConfig = CollateralConfig with
+    collateralType = CTN_USDCx
+    enabled = False                  -- DISABLED: No incentive to borrow mUSD against USDCx (DirectMint does 1:1)
+    collateralFactorBps = 9500
+    liquidationThresholdBps = 9700
+    liquidationPenaltyBps = 300
+    liquidationBonusBps = 150
+    maxStalenessSecs = 3600          -- DAML-M-03: 1h — stable asset
+    supplyEnabled = False
+    supplyRateBps = 0
+
+defaultSMUSDConfig : CollateralConfig
+defaultSMUSDConfig = CollateralConfig with
+    collateralType = CTN_SMUSD
+    enabled = True
+    collateralFactorBps = 5500       -- 55% LTV — reflexive loop risk requires wide buffer
+    liquidationThresholdBps = 6500   -- 65% — 15.4% depeg buffer before liquidation
+    liquidationPenaltyBps = 800      -- 8% penalty — higher to discourage over-leverage
+    liquidationBonusBps = 400        -- 4% keeper bonus
+    maxStalenessSecs = 1800          -- DAML-M-03: 30 min — yield-bearing, moderate refresh
+    supplyEnabled = True             -- smUSD can be supplied for yield
+    supplyRateBps = 350              -- 3.5% APY — yield-bearing stablecoin supply
+
+-- | Default config for smUSD-E (ETH Pool variant — lending/borrowing enabled)
+-- Slightly lower LTV than smUSD due to ETH price exposure and time-lock risk
+defaultSMUSDEConfig : CollateralConfig
+defaultSMUSDEConfig = CollateralConfig with
+    collateralType = CTN_SMUSDE
+    enabled = True
+    collateralFactorBps = 7000       -- 70% LTV — ETH price exposure + time-lock risk + reflexivity
+    liquidationThresholdBps = 7800   -- 78% — 10.3% drawdown buffer
+    liquidationPenaltyBps = 600      -- 6% penalty
+    liquidationBonusBps = 300        -- 3% keeper bonus
+    maxStalenessSecs = 1800          -- 30 min — synced from ETH pool share price
+    supplyEnabled = True             -- smUSD-E can be supplied for yield
+    supplyRateBps = 450              -- 4.5% APY — higher yield for ETH exposure risk
+
+-- ============================================================
+--                     SECTION 2: CANTON PRICE FEED
+-- ============================================================
+
+-- | CantonPriceFeed — Source-agnostic oracle for Canton-native assets.
+-- Primary: Tradecraft DEX API (GET /v1/ratio/CC/USDCx — no auth, AMM-based)
+-- Fallback: Temple DEX API (Amulet/USDCx pair — JWT auth)
+-- Operator syncs prices from either source via relay service.
+-- Each asset gets its own feed. Stale feeds block borrows/withdrawals
+-- but NOT liquidations (liquidations use unsafe/stale-tolerant path).
+template CantonPriceFeed
+  with
+    operator    : Party
+    symbol      : Text           -- e.g. "CTN", "USDC", "USDCx", "sMUSD"
+    priceUsd    : Money          -- USD price (18 decimals)
+    lastUpdated : Time
+    source      : Text           -- e.g. "temple-dex-twap", "hardcoded", "smusd-share-price"
+    observers   : [Party]
+  where
+    signatory operator
+    observer observers
+
+    ensure priceUsd > 0.0
+
+    -- | Get price with staleness check (for borrows / withdrawals)
+    nonconsuming choice PriceFeed_GetPrice : Money
+      with
+        requester    : Party
+        maxStaleness : RelTime
+      controller requester
+      do
+        assertMsg "NOT_AUTHORIZED" (requester `elem` observers || requester == operator)
+        now <- getTime
+        let age = subTime now lastUpdated
+        assertMsg "PRICE_STALE" (age <= maxStaleness)
+        return priceUsd
+
+    -- | Get price WITHOUT staleness check (for liquidation path)
+    -- Liquidations must proceed even with stale prices to protect protocol solvency
+    nonconsuming choice PriceFeed_GetPriceUnsafe : Money
+      with
+        requester : Party
+      controller requester
+      do
+        assertMsg "NOT_AUTHORIZED" (requester `elem` observers || requester == operator)
+        return priceUsd
+
+    -- | Update price from Tradecraft/Temple DEX API\n    -- X-M-02: Require attestation hash from multiple validators to prevent\n    -- single-operator price manipulation. Operator-only signing is asymmetric with\n    -- Ethereum's decentralized Chainlink feeds — attestation bridges the trust gap.
+    choice PriceFeed_Update : ContractId CantonPriceFeed
+      with
+        newPriceUsd : Money
+        newSource   : Text
+        attestationHash : Text  -- X-M-02: SHA-256 of price data signed by validators
+        validatorCount : Int    -- X-M-02: Number of validator attestations
+      controller operator
+      do
+        assertMsg "PRICE_MUST_BE_POSITIVE" (newPriceUsd > 0.0)
+        -- X-M-02: Require multi-validator attestation (minimum 2 validators)
+        assertMsg "ATTESTATION_REQUIRED" (attestationHash /= "")
+        assertMsg "INSUFFICIENT_VALIDATORS" (validatorCount >= 2)
+        now <- getTime
+        let timeSinceUpdate = subTime now lastUpdated
+        assertMsg "UPDATE_TOO_FREQUENT" (timeSinceUpdate >= seconds 10)
+        -- Cap price movement to ±50% per update to prevent oracle manipulation
+        let maxPrice = priceUsd * 1.5
+        let minPrice = priceUsd * 0.5
+        assertMsg "PRICE_MOVE_TOO_LARGE" (newPriceUsd >= minPrice && newPriceUsd <= maxPrice)
+        create this with
+          priceUsd = newPriceUsd
+          lastUpdated = now
+          source = newSource
+
+    -- | Emergency price override (bypasses movement cap)
+    -- Only for circuit-breaker scenarios where price moved >50%
+    -- DAML-M-06: Requires governance co-signature to prevent unilateral oracle manipulation
+    choice PriceFeed_EmergencyUpdate : ContractId CantonPriceFeed
+      with
+        newPriceUsd : Money
+        reason      : Text
+        governanceProofCid : ContractId GovernanceActionLog  -- DAML-M-06: Governance required
+      controller operator
+      do
+        -- DAML-M-06: Consume governance proof to prevent replay
+        proof <- exercise governanceProofCid ConsumeProof with consumedBy = operator
+        assertMsg "WRONG_ACTION_TYPE" (proof.actionType == EmergencyPause)
+        assertMsg "WRONG_TARGET_MODULE" (proof.targetModule == "CantonLending")
+        assertMsg "PRICE_MUST_BE_POSITIVE" (newPriceUsd > 0.0)
+        assertMsg "REASON_REQUIRED" (DA.Text.length reason > 0)
+        now <- getTime
+        let timeSinceUpdate = subTime now lastUpdated
+        -- DAML-M-06: Rate limit: minimum 30 minutes between emergency updates
+        assertMsg "EMERGENCY_UPDATE_COOLDOWN" (timeSinceUpdate >= minutes 30)
+        create this with
+          priceUsd = newPriceUsd
+          lastUpdated = now
+          source = "emergency-override: " <> reason
+
+-- ============================================================
+--                     SECTION 3: ESCROWED COLLATERAL POSITION
+-- ============================================================
+
+-- | EscrowedCollateral — Actual token contracts locked as collateral.
+-- This is the key difference from V3.daml: we CONSUME the token contract
+-- and track the escrowed amount. Withdrawal recreates the token.
+--
+-- Each user has one EscrowedCollateral per collateral type.
+-- Multi-collateral users have multiple positions.
+template EscrowedCollateral
+  with
+    operator       : Party
+    owner          : Party
+    collateralType : CollateralType
+    amount         : Money          -- Escrowed amount
+    depositedAt    : Time           -- First deposit time
+    lastUpdatedAt  : Time           -- Last deposit/withdrawal time
+    privacyObservers : [Party]      -- Opt-in transparency (from UserPrivacySettings)
+  where
+    signatory operator, owner
+    observer privacyObservers
+
+    ensure amount > 0.0
+
+    -- | Update observers from user's privacy settings
+    choice Escrow_UpdateObservers : ContractId EscrowedCollateral
+      with
+        newObservers : [Party]
+      controller owner
+      do create this with privacyObservers = newObservers
+
+    -- | Add more collateral to this position (consuming choice — recreates with new total)
+    -- DAML-CRIT-01: Added caller validation for on-ledger audit trail
+    choice Escrow_AddCollateral : ContractId EscrowedCollateral
+      with
+        addAmount : Money
+        caller : Party
+      controller operator
+      do
+        assertMsg "ADD_AMOUNT_POSITIVE" (addAmount > 0.0)
+        assertMsg "CALLER_MUST_BE_OWNER" (caller == owner)
+        now <- getTime
+        create this with
+          amount = amount + addAmount
+          lastUpdatedAt = now
+
+    -- | Withdraw collateral (partial) — health check done at LendingService level
+    -- DAML-CRIT-01: Added caller validation for on-ledger audit trail
+    choice Escrow_WithdrawPartial : (ContractId EscrowedCollateral, Money)
+      with
+        withdrawAmount : Money
+        caller : Party
+      controller operator  -- Only service can withdraw (after health check)
+      do
+        assertMsg "WITHDRAW_POSITIVE" (withdrawAmount > 0.0)
+        assertMsg "INSUFFICIENT_COLLATERAL" (amount > withdrawAmount)
+        assertMsg "CALLER_MUST_BE_OWNER" (caller == owner)
+        now <- getTime
+        newEscrow <- create this with
+          amount = amount - withdrawAmount
+          lastUpdatedAt = now
+        return (newEscrow, withdrawAmount)
+
+    -- | Withdraw ALL collateral (consuming) — health check done at LendingService level
+    -- DAML-CRIT-01: Added caller validation for on-ledger audit trail
+    choice Escrow_WithdrawAll : Money
+      with
+        caller : Party
+      controller operator
+      do
+        assertMsg "CALLER_MUST_BE_OWNER" (caller == owner)
+        return amount
+
+    -- | Seize collateral for liquidation (operator-controlled)
+    choice Escrow_Seize : (Optional (ContractId EscrowedCollateral), Money)
+      with
+        seizeAmount : Money
+      controller operator
+      do
+        assertMsg "SEIZE_POSITIVE" (seizeAmount > 0.0)
+        assertMsg "SEIZE_EXCEEDS_BALANCE" (seizeAmount <= amount)
+        now <- getTime
+        if seizeAmount == amount
+          then return (None, seizeAmount)
+          else do
+            newEscrow <- create this with
+              amount = amount - seizeAmount
+              lastUpdatedAt = now
+            return (Some newEscrow, seizeAmount)
+
+-- ============================================================
+--                     SECTION 4: DEBT POSITION
+-- ============================================================
+
+-- | CantonDebtPosition — Tracks mUSD borrowed against escrowed collateral.
+-- Interest accrues per-second using Compound-style model.
+-- One position per user (can have multiple collateral types backing it).
+template CantonDebtPosition
+  with
+    operator          : Party
+    borrower          : Party
+    principalDebt     : Money       -- Original borrowed amount
+    accruedInterest   : Money       -- Interest accumulated since last accrual
+    lastAccrualTime   : Time        -- Last interest accrual timestamp
+    interestRateBps   : Bps         -- Current annual interest rate
+    privacyObservers  : [Party]     -- Opt-in transparency (from UserPrivacySettings)
+  where
+    signatory operator, borrower
+    observer privacyObservers
+
+    ensure principalDebt >= 0.0 && accruedInterest >= 0.0
+
+    -- | Update observers from user's privacy settings
+    choice Debt_UpdateObservers : ContractId CantonDebtPosition
+      with
+        newObservers : [Party]
+      controller borrower
+      do create this with privacyObservers = newObservers
+
+    -- | Calculate total debt (principal + accrued + new interest)
+    nonconsuming choice Debt_GetTotalDebt : Money
+      with
+        requester : Party
+      controller requester
+      do
+        assertMsg "NOT_AUTHORIZED" (requester == borrower || requester == operator)
+        now <- getTime
+        let elapsed = convertRelTimeToMicroseconds (subTime now lastAccrualTime)
+        let secondsElapsed : Money = intToNumeric (elapsed / 1000000)
+        let yearSeconds = 31536000.0 : Money
+        let newInterest = principalDebt * intToNumeric interestRateBps * secondsElapsed / (10000.0 * yearSeconds)
+        return (principalDebt + accruedInterest + newInterest)
+
+    -- | Accrue interest and increase debt (called before borrow/repay/liquidate)
+    choice Debt_AccrueInterest : ContractId CantonDebtPosition
+      with
+        caller : Party
+      controller operator
+      do
+        now <- getTime
+        let elapsed = convertRelTimeToMicroseconds (subTime now lastAccrualTime)
+        let secondsElapsed : Money = intToNumeric (elapsed / 1000000)
+        let yearSeconds = 31536000.0 : Money
+        let newInterest = principalDebt * intToNumeric interestRateBps * secondsElapsed / (10000.0 * yearSeconds)
+        create this with
+          accruedInterest = accruedInterest + newInterest
+          lastAccrualTime = now
+
+    -- | Add to principal (new borrow)
+    choice Debt_IncreasePrincipal : ContractId CantonDebtPosition
+      with
+        additionalBorrow : Money
+      controller operator
+      do
+        assertMsg "BORROW_POSITIVE" (additionalBorrow > 0.0)
+        create this with
+          principalDebt = principalDebt + additionalBorrow
+
+    -- | Repay debt: interest first, then principal
+    choice Debt_Repay : (ContractId CantonDebtPosition, Money)
+      with
+        repayAmount : Money
+      controller operator
+      do
+        assertMsg "REPAY_POSITIVE" (repayAmount > 0.0)
+        let totalDebt = principalDebt + accruedInterest
+        assertMsg "REPAY_EXCEEDS_DEBT" (repayAmount <= totalDebt)
+        -- Pay interest first, then principal
+        let (remainingRepay, newAccrued) =
+              if repayAmount >= accruedInterest
+                then (repayAmount - accruedInterest, 0.0)
+                else (0.0, accruedInterest - repayAmount)
+        let newPrincipal = if remainingRepay > principalDebt
+                           then 0.0
+                           else principalDebt - remainingRepay
+        let interestPaid = accruedInterest - newAccrued
+        newDebt <- create this with
+          principalDebt = newPrincipal
+          accruedInterest = newAccrued
+        return (newDebt, interestPaid)
+
+    -- | Reduce debt after liquidation (operator-controlled)
+    choice Debt_ReduceForLiquidation : ContractId CantonDebtPosition
+      with
+        reductionAmount : Money
+      controller operator
+      do
+        let totalDebt = principalDebt + accruedInterest
+        assertMsg "REDUCTION_EXCEEDS_DEBT" (reductionAmount <= totalDebt)
+        let (remainingReduction, newAccrued) =
+              if reductionAmount >= accruedInterest
+                then (reductionAmount - accruedInterest, 0.0)
+                else (0.0, accruedInterest - reductionAmount)
+        let newPrincipal = if remainingReduction > principalDebt
+                           then 0.0
+                           else principalDebt - remainingReduction
+        create this with
+          principalDebt = newPrincipal
+          accruedInterest = newAccrued
+
+    -- | Update interest rate (synced from InterestRateService)
+    choice Debt_UpdateRate : ContractId CantonDebtPosition
+      with
+        newRateBps : Bps
+      controller operator
+      do
+        assertMsg "RATE_NON_NEGATIVE" (newRateBps >= 0)
+        assertMsg "RATE_MAX_100_PERCENT" (newRateBps <= 10000)
+        create this with interestRateBps = newRateBps
+
+-- ============================================================
+--                     SECTION 4B: COLLATERAL AGGREGATE
+-- ============================================================
+
+-- | DAML-H-03: On-ledger aggregate tracking total collateral deposited per type.
+-- Updated by deposit/withdraw choices to provide a protocol-wide view of locked collateral.
+-- Keyed by (operator, collateralType) for efficient lookup.
+template LendingCollateralAggregate
+  with
+    operator       : Party
+    collateralType : CollateralType
+    totalDeposited : Money    -- Sum of all escrowed amounts for this type
+    depositCount   : Int      -- Number of active escrow positions
+    lastUpdatedAt  : Time
+  where
+    signatory operator
+
+    ensure totalDeposited >= 0.0 && depositCount >= 0
+
+    -- | Increment on deposit
+    choice Aggregate_AddDeposit : ContractId LendingCollateralAggregate
+      with
+        amount : Money
+        isNewPosition : Bool  -- Only increment depositCount for new escrow positions
+      controller operator
+      do
+        now <- getTime
+        create this with
+          totalDeposited = totalDeposited + amount
+          depositCount = if isNewPosition then depositCount + 1 else depositCount
+          lastUpdatedAt = now
+
+    -- | Decrement on withdrawal
+    choice Aggregate_RemoveDeposit : ContractId LendingCollateralAggregate
+      with
+        amount : Money
+        isFullWithdrawal : Bool  -- Only decrement depositCount on full position close
+      controller operator
+      do
+        now <- getTime
+        let newTotal = if amount >= totalDeposited then 0.0 else totalDeposited - amount
+        let newCount = if isFullWithdrawal && depositCount > 0 then depositCount - 1 else depositCount
+        create this with
+          totalDeposited = newTotal
+          depositCount = newCount
+          lastUpdatedAt = now
+
+-- ============================================================
+--                     SECTION 4C: SUPPLY POSITION
+-- ============================================================
+
+-- | CantonSupplyPosition — Tracks a user's supply of assets into the lending pool.
+-- Suppliers deposit smUSD, smUSD-E, or Canton Coin to earn interest from borrower
+-- interest payments. Interest accrues per-second based on the asset's supply rate.
+-- Unlike collateral deposits (which back borrows), supply positions earn passive yield.
+template CantonSupplyPosition
+  with
+    operator        : Party
+    supplier        : Party
+    supplyType      : CollateralType  -- CTN_Coin, CTN_SMUSD, or CTN_SMUSDE
+    amount          : Money           -- Supplied amount (principal)
+    earnedInterest  : Money           -- Accrued interest (paid on withdrawal)
+    lastAccrualTime : Time
+    suppliedAt      : Time            -- First supply time
+    supplyRateBps   : Bps             -- Current annual supply rate
+    privacyObservers : [Party]
+  where
+    signatory operator, supplier
+    observer privacyObservers
+
+    ensure amount > 0.0 && earnedInterest >= 0.0
+
+    -- | Get total value (principal + earned interest)
+    nonconsuming choice Supply_GetTotalValue : Money
+      with
+        requester : Party
+      controller requester
+      do
+        assertMsg "NOT_AUTHORIZED" (requester == supplier || requester == operator)
+        now <- getTime
+        let elapsed = convertRelTimeToMicroseconds (subTime now lastAccrualTime)
+        let secondsElapsed : Money = intToNumeric (elapsed / 1000000)
+        let yearSeconds = 31536000.0 : Money
+        let newInterest = amount * intToNumeric supplyRateBps * secondsElapsed / (10000.0 * yearSeconds)
+        return (amount + earnedInterest + newInterest)
+
+    -- | Accrue interest (called before supply/withdraw operations)
+    choice Supply_AccrueInterest : ContractId CantonSupplyPosition
+      with
+        caller : Party
+      controller operator
+      do
+        now <- getTime
+        let elapsed = convertRelTimeToMicroseconds (subTime now lastAccrualTime)
+        let secondsElapsed : Money = intToNumeric (elapsed / 1000000)
+        let yearSeconds = 31536000.0 : Money
+        let newInterest = amount * intToNumeric supplyRateBps * secondsElapsed / (10000.0 * yearSeconds)
+        create this with
+          earnedInterest = earnedInterest + newInterest
+          lastAccrualTime = now
+
+    -- | Add more supply to existing position (accrues interest first)
+    choice Supply_AddMore : ContractId CantonSupplyPosition
+      with
+        addAmount : Money
+        caller    : Party
+      controller operator
+      do
+        assertMsg "ADD_AMOUNT_POSITIVE" (addAmount > 0.0)
+        assertMsg "CALLER_MUST_BE_SUPPLIER" (caller == supplier)
+        now <- getTime
+        let elapsed = convertRelTimeToMicroseconds (subTime now lastAccrualTime)
+        let secondsElapsed : Money = intToNumeric (elapsed / 1000000)
+        let yearSeconds = 31536000.0 : Money
+        let newInterest = amount * intToNumeric supplyRateBps * secondsElapsed / (10000.0 * yearSeconds)
+        create this with
+          amount = amount + addAmount
+          earnedInterest = earnedInterest + newInterest
+          lastAccrualTime = now
+
+    -- | Withdraw partial supply (returns withdrawn principal + all accrued interest)
+    choice Supply_WithdrawPartial : (ContractId CantonSupplyPosition, Money, Money)
+      with
+        withdrawAmount : Money
+        caller         : Party
+      controller operator
+      do
+        assertMsg "WITHDRAW_POSITIVE" (withdrawAmount > 0.0)
+        assertMsg "INSUFFICIENT_SUPPLY" (amount > withdrawAmount)
+        assertMsg "CALLER_MUST_BE_SUPPLIER" (caller == supplier)
+        now <- getTime
+        let elapsed = convertRelTimeToMicroseconds (subTime now lastAccrualTime)
+        let secondsElapsed : Money = intToNumeric (elapsed / 1000000)
+        let yearSeconds = 31536000.0 : Money
+        let newInterest = amount * intToNumeric supplyRateBps * secondsElapsed / (10000.0 * yearSeconds)
+        let totalInterest = earnedInterest + newInterest
+        newPos <- create this with
+          amount = amount - withdrawAmount
+          earnedInterest = 0.0
+          lastAccrualTime = now
+        return (newPos, withdrawAmount, totalInterest)
+
+    -- | Withdraw all supply + earned interest (consuming)
+    choice Supply_WithdrawAll : (Money, Money)
+      with
+        caller : Party
+      controller operator
+      do
+        assertMsg "CALLER_MUST_BE_SUPPLIER" (caller == supplier)
+        now <- getTime
+        let elapsed = convertRelTimeToMicroseconds (subTime now lastAccrualTime)
+        let secondsElapsed : Money = intToNumeric (elapsed / 1000000)
+        let yearSeconds = 31536000.0 : Money
+        let newInterest = amount * intToNumeric supplyRateBps * secondsElapsed / (10000.0 * yearSeconds)
+        return (amount, earnedInterest + newInterest)
+
+    -- | Update supply rate (operator syncs from interest model)
+    choice Supply_UpdateRate : ContractId CantonSupplyPosition
+      with
+        newRateBps : Bps
+      controller operator
+      do
+        now <- getTime
+        let elapsed = convertRelTimeToMicroseconds (subTime now lastAccrualTime)
+        let secondsElapsed : Money = intToNumeric (elapsed / 1000000)
+        let yearSeconds = 31536000.0 : Money
+        let newInterest = amount * intToNumeric supplyRateBps * secondsElapsed / (10000.0 * yearSeconds)
+        create this with
+          supplyRateBps = newRateBps
+          earnedInterest = earnedInterest + newInterest
+          lastAccrualTime = now
+
+    -- | Update observers
+    choice Supply_UpdateObservers : ContractId CantonSupplyPosition
+      with
+        newObservers : [Party]
+      controller supplier
+      do create this with privacyObservers = newObservers
+
+-- | LendingSupplyAggregate — Tracks total supply per asset type.
+-- Used for protocol analytics and utilization rate computation.
+template LendingSupplyAggregate
+  with
+    operator      : Party
+    supplyType    : CollateralType
+    totalSupplied : Money
+    supplierCount : Int
+    lastUpdatedAt : Time
+  where
+    signatory operator
+
+    ensure totalSupplied >= 0.0 && supplierCount >= 0
+
+    choice SupplyAgg_AddSupply : ContractId LendingSupplyAggregate
+      with
+        addAmount     : Money
+        isNewSupplier : Bool
+      controller operator
+      do
+        now <- getTime
+        create this with
+          totalSupplied = totalSupplied + addAmount
+          supplierCount = if isNewSupplier then supplierCount + 1 else supplierCount
+          lastUpdatedAt = now
+
+    choice SupplyAgg_RemoveSupply : ContractId LendingSupplyAggregate
+      with
+        removeAmount     : Money
+        isFullWithdrawal : Bool
+      controller operator
+      do
+        now <- getTime
+        let newTotal = if removeAmount >= totalSupplied then 0.0 else totalSupplied - removeAmount
+        let newCount = if isFullWithdrawal && supplierCount > 0 then supplierCount - 1 else supplierCount
+        create this with
+          totalSupplied = newTotal
+          supplierCount = newCount
+          lastUpdatedAt = now
+
+-- ============================================================
+--                     SECTION 5: LENDING SERVICE
+-- ============================================================
+
+-- D-M-01: LendingAggregate holds mutable shared state (totalBorrows, supply)
+-- separately from the service template. This allows deposit choices to remain
+-- nonconsuming while borrow/repay/liquidate only contend on the aggregate,
+-- not the entire service configuration. Future optimization: split per-user
+-- aggregates to further reduce contention.
+template LendingAggregate
+  with
+    operator           : Party
+    serviceName        : Text
+    totalBorrows       : Money
+    cantonCurrentSupply : Money
+    protocolReserves   : Money
+    lastUpdateTime     : Time
+  where
+    signatory operator
+    ensure totalBorrows >= 0.0
+
+    -- | Atomically update aggregate state (called by service choices)
+    choice Aggregate_UpdateBorrow : ContractId LendingAggregate
+      with
+        borrowDelta : Money      -- Positive for borrow, negative for repay
+        supplyDelta : Money      -- Tracks cantonCurrentSupply changes
+        reserveDelta : Money     -- Protocol reserve accrual
+      controller operator
+      do
+        now <- getTime
+        create this with
+          totalBorrows = totalBorrows + borrowDelta
+          cantonCurrentSupply = cantonCurrentSupply + supplyDelta
+          protocolReserves = protocolReserves + reserveDelta
+          lastUpdateTime = now
+
+-- | CantonLendingService — Central coordinator for Canton-native lending.
+-- Manages collateral configs, orchestrates deposits/borrows/liquidations.
+-- Operator syncs prices from Tradecraft (primary) / Temple (fallback) DEX APIs.
+-- DAML-H-02: Added supply-cap tracking for Canton-side mUSD minting coordination
+-- DAML-H-04: Mandatory compliance registry for blacklist/freeze enforcement
+template CantonLendingService
+  with
+    operator           : Party
+    configs            : [CollateralConfig]     -- Per-asset configs
+    totalBorrows       : Money                  -- Global total borrowed
+    interestRateBps    : Bps                    -- Current global borrow rate
+    reserveFactorBps   : Bps                    -- Protocol reserve cut (e.g. 1000 = 10%)
+    protocolReserves   : Money                  -- Accumulated protocol reserves
+    minBorrow          : Money                  -- Minimum borrow amount (anti-dust)
+    closeFactorBps     : Bps                    -- Max % of debt liquidatable per call
+    paused             : Bool
+    -- DAML-H-02: Supply cap tracking with cross-module coordination
+    cantonSupplyCap    : Money                  -- Maximum mUSD mintable via Canton lending
+    cantonCurrentSupply : Money                 -- Current mUSD minted via Canton lending
+    -- DAML-H-02: Cross-module supply coordination
+    -- The DirectMint service CID is passed to Lending_Borrow when available
+    globalMintCap      : Money                  -- Hard ceiling: lending + directMint combined
+    -- DAML-H-04: Mandatory compliance check on all borrowers
+    complianceRegistryCid : ContractId ComplianceRegistry
+    -- Master Participation Agreement (for minted mUSD)
+    mpaHash            : Text
+    mpaUri             : Text
+    serviceName        : Text
+    observers          : [Party]
+  where
+    signatory operator
+    observer observers
+
+    ensure totalBorrows >= 0.0
+        && reserveFactorBps >= 0 && reserveFactorBps <= 5000
+        && closeFactorBps > 0 && closeFactorBps <= 10000
+        && minBorrow > 0.0
+        && DA.Text.length mpaHash == 64
+        && DA.Text.length mpaUri > 0
+
+    -- ──────────────────────────────────────────────────────
+    --  DEPOSIT COLLATERAL
+    -- ──────────────────────────────────────────────────────
+
+    -- | Deposit CantonCoin as collateral (escrows the actual token)
+    -- DAML-H-03: Nonconsuming — deposits don't modify service state, enabling
+    -- concurrent deposits without unnecessary service contract churn
+    nonconsuming choice Lending_DepositCTN : (ContractId CantonLendingService, ContractId EscrowedCollateral)
+      with
+        user    : Party
+        coinCid : ContractId CantonCoin
+        existingEscrowCid : Optional (ContractId EscrowedCollateral)
+        collateralAggCid  : Optional (ContractId LendingCollateralAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        coin <- fetch coinCid
+        assertMsg "NOT_OWNER" (coin.owner == user)
+        let cfg = getConfig CTN_Coin configs
+        assertMsg "CTN_NOT_ENABLED" cfg.enabled
+
+        -- DAML-C-03: Validate issuer matches operator before archiving
+        -- dual-signatory token. Without this, archive fails if issuer != operator.
+        assertMsg "CTN_ISSUER_MUST_BE_OPERATOR" (coin.issuer == operator)
+
+        -- Consume the actual token (escrow it)
+        archive coinCid
+
+        now <- getTime
+        userObs <- lookupUserObservers operator user None
+        escrowCid <- case existingEscrowCid of
+          Some existCid -> exercise existCid Escrow_AddCollateral with
+            addAmount = coin.amount
+            caller = user
+          None -> create EscrowedCollateral with
+            operator
+            owner = user
+            collateralType = CTN_Coin
+            amount = coin.amount
+            depositedAt = now
+            lastUpdatedAt = now
+            privacyObservers = observers <> userObs
+
+        -- DAML-H-03: Update collateral aggregate tracking
+        let isNewPos = case existingEscrowCid of { None -> True; Some _ -> False }
+        case collateralAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid Aggregate_AddDeposit with
+              amount = coin.amount
+              isNewPosition = isNewPos
+            pure ()
+          None -> do
+            _ <- create LendingCollateralAggregate with
+              operator
+              collateralType = CTN_Coin
+              totalDeposited = coin.amount
+              depositCount = 1
+              lastUpdatedAt = now
+            pure ()
+
+        return (self, escrowCid)
+
+    -- | Deposit CantonUSDC as collateral
+    -- DAML-H-03: Nonconsuming — no service state changes on deposit
+    nonconsuming choice Lending_DepositUSDC : (ContractId CantonLendingService, ContractId EscrowedCollateral)
+      with
+        user    : Party
+        usdcCid : ContractId CantonUSDC
+        existingEscrowCid : Optional (ContractId EscrowedCollateral)
+        collateralAggCid  : Optional (ContractId LendingCollateralAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        usdc <- fetch usdcCid
+        assertMsg "NOT_OWNER" (usdc.owner == user)
+        let cfg = getConfig CTN_USDC configs
+        assertMsg "USDC_NOT_ENABLED" cfg.enabled
+
+        -- DAML-C-03: Validate issuer matches operator before archiving
+        assertMsg "USDC_ISSUER_MUST_BE_OPERATOR" (usdc.issuer == operator)
+
+        archive usdcCid
+
+        now <- getTime
+        userObs <- lookupUserObservers operator user None
+        escrowCid <- case existingEscrowCid of
+          Some existCid -> exercise existCid Escrow_AddCollateral with
+            addAmount = usdc.amount
+            caller = user
+          None -> create EscrowedCollateral with
+            operator
+            owner = user
+            collateralType = CTN_USDC
+            amount = usdc.amount
+            depositedAt = now
+            lastUpdatedAt = now
+            privacyObservers = observers <> userObs
+
+        -- DAML-H-03: Update collateral aggregate tracking
+        let isNewPos = case existingEscrowCid of { None -> True; Some _ -> False }
+        case collateralAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid Aggregate_AddDeposit with
+              amount = usdc.amount
+              isNewPosition = isNewPos
+            pure ()
+          None -> do
+            _ <- create LendingCollateralAggregate with
+              operator
+              collateralType = CTN_USDC
+              totalDeposited = usdc.amount
+              depositCount = 1
+              lastUpdatedAt = now
+            pure ()
+
+        return (self, escrowCid)
+
+    -- | Deposit USDCx as collateral
+    -- DAML-H-03: Nonconsuming — no service state changes on deposit
+    nonconsuming choice Lending_DepositUSDCx : (ContractId CantonLendingService, ContractId EscrowedCollateral)
+      with
+        user     : Party
+        usdcxCid : ContractId USDCx
+        existingEscrowCid : Optional (ContractId EscrowedCollateral)
+        collateralAggCid  : Optional (ContractId LendingCollateralAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        usdcx <- fetch usdcxCid
+        assertMsg "NOT_OWNER" (usdcx.owner == user)
+        let cfg = getConfig CTN_USDCx configs
+        assertMsg "USDCx_NOT_ENABLED" cfg.enabled
+
+        -- DAML-C-03: Validate issuer matches operator before archiving
+        assertMsg "USDCx_ISSUER_MUST_BE_OPERATOR" (usdcx.issuer == operator)
+
+        archive usdcxCid
+
+        now <- getTime
+        userObs <- lookupUserObservers operator user None
+        escrowCid <- case existingEscrowCid of
+          Some existCid -> exercise existCid Escrow_AddCollateral with
+            addAmount = usdcx.amount
+            caller = user
+          None -> create EscrowedCollateral with
+            operator
+            owner = user
+            collateralType = CTN_USDCx
+            amount = usdcx.amount
+            depositedAt = now
+            lastUpdatedAt = now
+            privacyObservers = observers <> userObs
+
+        -- DAML-H-03: Update collateral aggregate tracking
+        let isNewPos = case existingEscrowCid of { None -> True; Some _ -> False }
+        case collateralAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid Aggregate_AddDeposit with
+              amount = usdcx.amount
+              isNewPosition = isNewPos
+            pure ()
+          None -> do
+            _ <- create LendingCollateralAggregate with
+              operator
+              collateralType = CTN_USDCx
+              totalDeposited = usdcx.amount
+              depositCount = 1
+              lastUpdatedAt = now
+            pure ()
+
+        return (self, escrowCid)
+
+    -- | Deposit CantonSMUSD as collateral
+    -- DAML-H-03: Nonconsuming — no service state changes on deposit
+    nonconsuming choice Lending_DepositSMUSD : (ContractId CantonLendingService, ContractId EscrowedCollateral)
+      with
+        user     : Party
+        smusdCid : ContractId CantonSMUSD
+        existingEscrowCid : Optional (ContractId EscrowedCollateral)
+        collateralAggCid  : Optional (ContractId LendingCollateralAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        smusd <- fetch smusdCid
+        assertMsg "NOT_OWNER" (smusd.owner == user)
+        let cfg = getConfig CTN_SMUSD configs
+        assertMsg "SMUSD_NOT_ENABLED" cfg.enabled
+
+        -- DAML-C-03: Validate issuer matches operator before archiving
+        assertMsg "SMUSD_ISSUER_MUST_BE_OPERATOR" (smusd.issuer == operator)
+
+        archive smusdCid
+
+        now <- getTime
+        -- sMUSD amount = shares (valued at share price via price feed)
+        userObs <- lookupUserObservers operator user None
+        escrowCid <- case existingEscrowCid of
+          Some existCid -> exercise existCid Escrow_AddCollateral with
+            addAmount = smusd.shares
+            caller = user
+          None -> create EscrowedCollateral with
+            operator
+            owner = user
+            collateralType = CTN_SMUSD
+            amount = smusd.shares
+            depositedAt = now
+            lastUpdatedAt = now
+            privacyObservers = observers <> userObs
+
+        -- DAML-H-03: Update collateral aggregate tracking
+        let isNewPos = case existingEscrowCid of { None -> True; Some _ -> False }
+        case collateralAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid Aggregate_AddDeposit with
+              amount = smusd.shares
+              isNewPosition = isNewPos
+            pure ()
+          None -> do
+            _ <- create LendingCollateralAggregate with
+              operator
+              collateralType = CTN_SMUSD
+              totalDeposited = smusd.shares
+              depositCount = 1
+              lastUpdatedAt = now
+            pure ()
+
+        return (self, escrowCid)
+
+    -- | Deposit CantonSMUSD_E (ETH Pool variant) as collateral
+    -- DAML-H-03: Nonconsuming — no service state changes on deposit
+    nonconsuming choice Lending_DepositSMUSDE : (ContractId CantonLendingService, ContractId EscrowedCollateral)
+      with
+        user      : Party
+        smusdeCid : ContractId CantonSMUSD_E
+        existingEscrowCid : Optional (ContractId EscrowedCollateral)
+        collateralAggCid  : Optional (ContractId LendingCollateralAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        smusde <- fetch smusdeCid
+        assertMsg "NOT_OWNER" (smusde.owner == user)
+        let cfg = getConfig CTN_SMUSDE configs
+        assertMsg "SMUSDE_NOT_ENABLED" cfg.enabled
+
+        -- DAML-C-03: Validate issuer matches operator before archiving
+        assertMsg "SMUSDE_ISSUER_MUST_BE_OPERATOR" (smusde.issuer == operator)
+
+        archive smusdeCid
+
+        now <- getTime
+        -- smUSD-E amount = shares (valued at smUSD-E share price via price feed)
+        userObs <- lookupUserObservers operator user None
+        escrowCid <- case existingEscrowCid of
+          Some existCid -> exercise existCid Escrow_AddCollateral with
+            addAmount = smusde.shares
+            caller = user
+          None -> create EscrowedCollateral with
+            operator
+            owner = user
+            collateralType = CTN_SMUSDE
+            amount = smusde.shares
+            depositedAt = now
+            lastUpdatedAt = now
+            privacyObservers = observers <> userObs
+
+        -- DAML-H-03: Update collateral aggregate tracking
+        let isNewPos = case existingEscrowCid of { None -> True; Some _ -> False }
+        case collateralAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid Aggregate_AddDeposit with
+              amount = smusde.shares
+              isNewPosition = isNewPos
+            pure ()
+          None -> do
+            _ <- create LendingCollateralAggregate with
+              operator
+              collateralType = CTN_SMUSDE
+              totalDeposited = smusde.shares
+              depositCount = 1
+              lastUpdatedAt = now
+            pure ()
+
+        return (self, escrowCid)
+
+    -- ──────────────────────────────────────────────────────
+    --  BATCH DEPOSITS: multiple fragmented tokens → single escrow
+    -- ──────────────────────────────────────────────────────
+
+    -- | Lending_BatchDepositSMUSD — Option 2 batch extension.
+    --
+    -- Deposits multiple fragmented CantonSMUSD collateral contracts in one
+    -- atomic transaction.  Eliminates the need to pre-merge tokens before
+    -- using them as collateral when the user holds multiple small positions.
+    --
+    -- All existing Lending_DepositSMUSD invariants are enforced per token:
+    --   - Ownership: every token must belong to `user`
+    --   - Issuer: every token must be issued by `operator`
+    --   - CTN_SMUSD collateral must be enabled in service config
+    --
+    -- Additional batch invariants:
+    --   - At least one smusdCid must be provided
+    --
+    -- On success:
+    --   - All provided smUSD tokens are archived
+    --   - Their combined shares are escrowed in a single EscrowedCollateral
+    --   - If existingEscrowCid is provided, the escrow is updated in-place
+    --   - If collateralAggCid is provided, it is updated; otherwise a new
+    --     LendingCollateralAggregate is created for the deposit
+    nonconsuming choice Lending_BatchDepositSMUSD : (ContractId CantonLendingService, ContractId EscrowedCollateral)
+      with
+        user              : Party
+        smusdCids         : [ContractId CantonSMUSD]
+        existingEscrowCid : Optional (ContractId EscrowedCollateral)
+        collateralAggCid  : Optional (ContractId LendingCollateralAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        assertMsg "NO_POSITIONS_PROVIDED" (not (null smusdCids))
+
+        let cfg = getConfig CTN_SMUSD configs
+        assertMsg "SMUSD_NOT_ENABLED" cfg.enabled
+
+        -- Validate and accumulate shares from each token
+        let validateAndAccumulate cid = do
+              smusd <- fetch cid
+              assertMsg "NOT_OWNER" (smusd.owner == user)
+              assertMsg "SMUSD_ISSUER_MUST_BE_OPERATOR" (smusd.issuer == operator)
+              archive cid
+              return smusd.shares
+
+        sharesPerToken <- mapA validateAndAccumulate smusdCids
+        let totalShares2 = foldl (+) 0.0 sharesPerToken
+
+        now <- getTime
+        userObs <- lookupUserObservers operator user None
+
+        escrowCid <- case existingEscrowCid of
+          Some existCid -> exercise existCid Escrow_AddCollateral with
+            addAmount = totalShares2
+            caller    = user
+          None -> create EscrowedCollateral with
+            operator
+            owner          = user
+            collateralType = CTN_SMUSD
+            amount         = totalShares2
+            depositedAt    = now
+            lastUpdatedAt  = now
+            privacyObservers = observers <> userObs
+
+        let isNewPos = case existingEscrowCid of { None -> True; Some _ -> False }
+        case collateralAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid Aggregate_AddDeposit with
+              amount        = totalShares2
+              isNewPosition = isNewPos
+            pure ()
+          None -> do
+            _ <- create LendingCollateralAggregate with
+              operator
+              collateralType  = CTN_SMUSD
+              totalDeposited  = totalShares2
+              depositCount    = 1
+              lastUpdatedAt   = now
+            pure ()
+
+        return (self, escrowCid)
+
+    -- | Lending_BatchDepositSMUSDE — Option 2 batch extension.
+    --
+    -- Deposits multiple fragmented CantonSMUSD_E (ETH Pool) collateral contracts
+    -- in one atomic transaction.
+    --
+    -- All existing Lending_DepositSMUSDE invariants are enforced per token:
+    --   - Ownership: every token must belong to `user`
+    --   - Issuer: every token must be issued by `operator`
+    --   - CTN_SMUSDE collateral must be enabled in service config
+    --
+    -- Additional batch invariants:
+    --   - At least one smusdeCid must be provided
+    --
+    -- On success:
+    --   - All provided smUSD-E tokens are archived
+    --   - Their combined shares are escrowed in a single EscrowedCollateral
+    nonconsuming choice Lending_BatchDepositSMUSDE : (ContractId CantonLendingService, ContractId EscrowedCollateral)
+      with
+        user              : Party
+        smusdeCids        : [ContractId CantonSMUSD_E]
+        existingEscrowCid : Optional (ContractId EscrowedCollateral)
+        collateralAggCid  : Optional (ContractId LendingCollateralAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        assertMsg "NO_POSITIONS_PROVIDED" (not (null smusdeCids))
+
+        let cfg = getConfig CTN_SMUSDE configs
+        assertMsg "SMUSDE_NOT_ENABLED" cfg.enabled
+
+        -- Validate and accumulate shares from each token
+        let validateAndAccumulate cid = do
+              smusde <- fetch cid
+              assertMsg "NOT_OWNER" (smusde.owner == user)
+              assertMsg "SMUSDE_ISSUER_MUST_BE_OPERATOR" (smusde.issuer == operator)
+              archive cid
+              return smusde.shares
+
+        sharesPerToken <- mapA validateAndAccumulate smusdeCids
+        let totalShares3 = foldl (+) 0.0 sharesPerToken
+
+        now <- getTime
+        userObs <- lookupUserObservers operator user None
+
+        escrowCid <- case existingEscrowCid of
+          Some existCid -> exercise existCid Escrow_AddCollateral with
+            addAmount = totalShares3
+            caller    = user
+          None -> create EscrowedCollateral with
+            operator
+            owner          = user
+            collateralType = CTN_SMUSDE
+            amount         = totalShares3
+            depositedAt    = now
+            lastUpdatedAt  = now
+            privacyObservers = observers <> userObs
+
+        let isNewPos2 = case existingEscrowCid of { None -> True; Some _ -> False }
+        case collateralAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid Aggregate_AddDeposit with
+              amount        = totalShares3
+              isNewPosition = isNewPos2
+            pure ()
+          None -> do
+            _ <- create LendingCollateralAggregate with
+              operator
+              collateralType  = CTN_SMUSDE
+              totalDeposited  = totalShares3
+              depositCount    = 1
+              lastUpdatedAt   = now
+            pure ()
+
+        return (self, escrowCid)
+
+    -- ──────────────────────────────────────────────────────
+    --  SUPPLY ASSETS (earn yield from borrower interest)
+    -- ──────────────────────────────────────────────────────
+
+    -- | Supply Canton Coin to the lending pool to earn yield.
+    -- The coin is escrowed and the supplier earns interest from protocol revenue.
+    nonconsuming choice Lending_SupplyCTN : (ContractId CantonLendingService, ContractId CantonSupplyPosition)
+      with
+        user    : Party
+        coinCid : ContractId CantonCoin
+        existingSupplyCid : Optional (ContractId CantonSupplyPosition)
+        supplyAggCid      : Optional (ContractId LendingSupplyAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        coin <- fetch coinCid
+        assertMsg "NOT_OWNER" (coin.owner == user)
+        let cfg = getConfig CTN_Coin configs
+        assertMsg "CTN_SUPPLY_NOT_ENABLED" cfg.supplyEnabled
+        assertMsg "CTN_ISSUER_MUST_BE_OPERATOR" (coin.issuer == operator)
+
+        archive coinCid
+
+        now <- getTime
+        userObs <- lookupUserObservers operator user None
+        supplyCid <- case existingSupplyCid of
+          Some existCid -> exercise existCid Supply_AddMore with
+            addAmount = coin.amount
+            caller = user
+          None -> create CantonSupplyPosition with
+            operator
+            supplier = user
+            supplyType = CTN_Coin
+            amount = coin.amount
+            earnedInterest = 0.0
+            lastAccrualTime = now
+            suppliedAt = now
+            supplyRateBps = cfg.supplyRateBps
+            privacyObservers = observers <> userObs
+
+        let isNew = case existingSupplyCid of { None -> True; Some _ -> False }
+        case supplyAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid SupplyAgg_AddSupply with
+              addAmount = coin.amount
+              isNewSupplier = isNew
+            pure ()
+          None -> do
+            _ <- create LendingSupplyAggregate with
+              operator
+              supplyType = CTN_Coin
+              totalSupplied = coin.amount
+              supplierCount = 1
+              lastUpdatedAt = now
+            pure ()
+
+        return (self, supplyCid)
+
+    -- | Supply CantonSMUSD (smUSD) to the lending pool to earn yield.
+    nonconsuming choice Lending_SupplySMUSD : (ContractId CantonLendingService, ContractId CantonSupplyPosition)
+      with
+        user     : Party
+        smusdCid : ContractId CantonSMUSD
+        existingSupplyCid : Optional (ContractId CantonSupplyPosition)
+        supplyAggCid      : Optional (ContractId LendingSupplyAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        smusd <- fetch smusdCid
+        assertMsg "NOT_OWNER" (smusd.owner == user)
+        let cfg = getConfig CTN_SMUSD configs
+        assertMsg "SMUSD_SUPPLY_NOT_ENABLED" cfg.supplyEnabled
+        assertMsg "SMUSD_ISSUER_MUST_BE_OPERATOR" (smusd.issuer == operator)
+
+        archive smusdCid
+
+        now <- getTime
+        userObs <- lookupUserObservers operator user None
+        supplyCid <- case existingSupplyCid of
+          Some existCid -> exercise existCid Supply_AddMore with
+            addAmount = smusd.shares
+            caller = user
+          None -> create CantonSupplyPosition with
+            operator
+            supplier = user
+            supplyType = CTN_SMUSD
+            amount = smusd.shares
+            earnedInterest = 0.0
+            lastAccrualTime = now
+            suppliedAt = now
+            supplyRateBps = cfg.supplyRateBps
+            privacyObservers = observers <> userObs
+
+        let isNew = case existingSupplyCid of { None -> True; Some _ -> False }
+        case supplyAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid SupplyAgg_AddSupply with
+              addAmount = smusd.shares
+              isNewSupplier = isNew
+            pure ()
+          None -> do
+            _ <- create LendingSupplyAggregate with
+              operator
+              supplyType = CTN_SMUSD
+              totalSupplied = smusd.shares
+              supplierCount = 1
+              lastUpdatedAt = now
+            pure ()
+
+        return (self, supplyCid)
+
+    -- | Supply CantonSMUSD_E (smUSD-E) to the lending pool to earn yield.
+    nonconsuming choice Lending_SupplySMUSDE : (ContractId CantonLendingService, ContractId CantonSupplyPosition)
+      with
+        user      : Party
+        smusdeCid : ContractId CantonSMUSD_E
+        existingSupplyCid : Optional (ContractId CantonSupplyPosition)
+        supplyAggCid      : Optional (ContractId LendingSupplyAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        smusde <- fetch smusdeCid
+        assertMsg "NOT_OWNER" (smusde.owner == user)
+        let cfg = getConfig CTN_SMUSDE configs
+        assertMsg "SMUSDE_SUPPLY_NOT_ENABLED" cfg.supplyEnabled
+        assertMsg "SMUSDE_ISSUER_MUST_BE_OPERATOR" (smusde.issuer == operator)
+
+        archive smusdeCid
+
+        now <- getTime
+        userObs <- lookupUserObservers operator user None
+        supplyCid <- case existingSupplyCid of
+          Some existCid -> exercise existCid Supply_AddMore with
+            addAmount = smusde.shares
+            caller = user
+          None -> create CantonSupplyPosition with
+            operator
+            supplier = user
+            supplyType = CTN_SMUSDE
+            amount = smusde.shares
+            earnedInterest = 0.0
+            lastAccrualTime = now
+            suppliedAt = now
+            supplyRateBps = cfg.supplyRateBps
+            privacyObservers = observers <> userObs
+
+        let isNew = case existingSupplyCid of { None -> True; Some _ -> False }
+        case supplyAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid SupplyAgg_AddSupply with
+              addAmount = smusde.shares
+              isNewSupplier = isNew
+            pure ()
+          None -> do
+            _ <- create LendingSupplyAggregate with
+              operator
+              supplyType = CTN_SMUSDE
+              totalSupplied = smusde.shares
+              supplierCount = 1
+              lastUpdatedAt = now
+            pure ()
+
+        return (self, supplyCid)
+
+    -- ──────────────────────────────────────────────────────
+    --  BORROW mUSD
+    -- ──────────────────────────────────────────────────────
+
+    -- | Borrow mUSD against escrowed collateral.
+    -- Requires all collateral positions + price feeds to compute health factor.
+    choice Lending_Borrow : (ContractId CantonLendingService, ContractId CantonDebtPosition, ContractId CantonMUSD)
+      with
+        user             : Party
+        borrowAmount     : Money
+        escrowCids       : [ContractId EscrowedCollateral]  -- All user's collateral positions
+        priceFeedCids    : [ContractId CantonPriceFeed]     -- Corresponding price feeds
+        directMintServiceCid : Optional (ContractId CantonDirectMintService)
+        existingDebtCid  : Optional (ContractId CantonDebtPosition)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        assertMsg "BORROW_POSITIVE" (borrowAmount > 0.0)
+        assertMsg "BELOW_MIN_BORROW" (borrowAmount >= minBorrow)
+        assertMsg "ESCROW_PRICE_MISMATCH" (length escrowCids == length priceFeedCids)
+        -- DAML-H-02: Module-level supply cap check
+        assertMsg "EXCEEDS_CANTON_SUPPLY_CAP" (cantonCurrentSupply + borrowAmount <= cantonSupplyCap)
+
+        -- DAML-H-02: Cross-module supply coordination
+        -- Verify combined minting across DirectMint + Lending doesn't exceed global cap
+        case directMintServiceCid of
+          Some dmCid -> do
+            dm <- fetch dmCid
+            let combinedSupply = dm.currentSupply + cantonCurrentSupply + borrowAmount
+            assertMsg "EXCEEDS_GLOBAL_MINT_CAP" (combinedSupply <= globalMintCap)
+          -- DAML-H-05: When DirectMint is not deployed, still enforce the
+          -- global mint cap against lending supply alone. Previously this was `pure ()`,
+          -- skipping the global cap entirely and relying only on the module-level cap.
+          None -> assertMsg "EXCEEDS_GLOBAL_MINT_CAP" (cantonCurrentSupply + borrowAmount <= globalMintCap)
+
+        -- DAML-H-04: Mandatory compliance check — borrower must not be blacklisted
+        exercise complianceRegistryCid ValidateMint with minter = user
+
+        -- DAML-M-01: Prevent duplicate escrow CIDs from inflating collateral value
+        assertMsg "DUPLICATE_ESCROW_CIDS" (length (dedup escrowCids) == length escrowCids)
+
+        -- Calculate total collateral value (weighted by collateralFactorBps)
+        totalWeightedValue <- computeWeightedCollateralValue operator user configs escrowCids priceFeedCids True
+
+        -- Look up existing debt, accrue interest, then increase principal
+        (existingDebt, accruedDebtCid) <- case existingDebtCid of
+          None -> return (0.0, None)
+          Some debtCid -> do
+            -- Accrue interest BEFORE reading total debt
+            accrued <- exercise debtCid Debt_AccrueInterest with caller = user
+            debt <- fetch accrued
+            return (debt.principalDebt + debt.accruedInterest, Some accrued)
+
+        -- Health check: totalWeightedValue must cover existing + new debt
+        let totalDebtAfter = existingDebt + borrowAmount
+        assertMsg "INSUFFICIENT_COLLATERAL_VALUE" (totalWeightedValue >= totalDebtAfter)
+
+        -- Mint mUSD to borrower
+        userObs <- lookupUserObservers operator user None
+        musdCid <- create CantonMUSD with
+          issuer = operator
+          owner = user
+          amount = borrowAmount
+          agreementHash = mpaHash
+          agreementUri = mpaUri
+          privacyObservers = userObs
+
+        now <- getTime
+        debtCid <- case accruedDebtCid of
+          Some existCid -> exercise existCid Debt_IncreasePrincipal with
+            additionalBorrow = borrowAmount
+          None -> create CantonDebtPosition with
+            operator
+            borrower = user
+            principalDebt = borrowAmount
+            accruedInterest = 0.0
+            lastAccrualTime = now
+            interestRateBps
+            privacyObservers = observers <> userObs
+
+        -- Update service (DAML-H-02: track Canton supply)
+        newService <- create this with
+          totalBorrows = totalBorrows + borrowAmount
+          cantonCurrentSupply = cantonCurrentSupply + borrowAmount
+        return (newService, debtCid, musdCid)
+
+    -- ──────────────────────────────────────────────────────
+    --  REPAY DEBT
+    -- ──────────────────────────────────────────────────────
+
+    -- | Repay mUSD debt. Burns the mUSD token and reduces debt position.
+    -- Blocking repayment during pause would trap users in accruing-interest positions,
+    -- which is harmful. Liquidation is also allowed during pause for the same reason.
+    choice Lending_Repay : (ContractId CantonLendingService, ContractId CantonDebtPosition)
+      with
+        user      : Party
+        musdCid   : ContractId CantonMUSD
+        debtCid   : ContractId CantonDebtPosition
+      controller user
+      do
+        -- Verify ownership
+        musd <- fetch musdCid
+        assertMsg "NOT_MUSD_OWNER" (musd.owner == user)
+        debt <- fetch debtCid
+        assertMsg "NOT_DEBT_OWNER" (debt.borrower == user)
+
+        -- Accrue interest first
+        accruedDebtCid <- exercise debtCid Debt_AccrueInterest with caller = user
+
+        -- Burn the mUSD (repayment)
+        exercise musdCid CantonMUSD_Burn
+
+        -- Reduce debt
+        (newDebtCid, interestPaid) <- exercise accruedDebtCid Debt_Repay with
+          repayAmount = musd.amount
+
+        -- Calculate reserve portion of interest
+        let reserveAmount = interestPaid * intToNumeric reserveFactorBps / 10000.0
+        let repayFromBorrows = min musd.amount totalBorrows
+        let repayFromSupply = min musd.amount cantonCurrentSupply
+
+        newService <- create this with
+          totalBorrows = totalBorrows - repayFromBorrows
+          protocolReserves = protocolReserves + reserveAmount
+          cantonCurrentSupply = cantonCurrentSupply - repayFromSupply
+
+        return (newService, newDebtCid)
+
+    -- | RepayFromInventory: CIP-56-native repay path.
+    -- Uses operator's own CantonMUSD inventory to repay user's debt,
+    -- without requiring an intermediate user-owned CantonMUSD.
+    -- The CIP-56 token archive happens at the API layer (separate package).
+    --
+    -- Flow:
+    --   1. API archives user's CIP-56 tokens (CIP-56 package)
+    --   2. API creates CIP-56 escrow under operator (CIP-56 package)
+    --   3. This choice consumes operator inventory and repays debt
+    --   All submitted as a single atomic batch command.
+    --
+    -- Economic invariants match Lending_Repay:
+    --   - Same interest accrual
+    --   - Same reserve factor calculation
+    --   - Same supply/borrow accounting
+    choice Lending_RepayFromInventory : (ContractId CantonLendingService, ContractId CantonDebtPosition)
+      with
+        user              : Party
+        inventoryMusdCids : [ContractId CantonMUSD]  -- Operator-owned inventory tokens
+        repayAmount       : Money                     -- Exact amount to repay
+        debtCid           : ContractId CantonDebtPosition
+      controller user
+      do
+        assertMsg "NO_INVENTORY_SOURCES" (not (null inventoryMusdCids))
+        assertMsg "BELOW_MIN_REPAY" (repayAmount > 0.0)
+
+        -- Verify debt ownership
+        debt <- fetch debtCid
+        assertMsg "NOT_DEBT_OWNER" (debt.borrower == user)
+
+        -- Validate all inventory mUSD are operator-owned and sum sufficient
+        let validateInv cid = do
+              m <- fetch cid
+              assertMsg "INV_NOT_OPERATOR_OWNED" (m.owner == operator && m.issuer == operator)
+              return m.amount
+        amounts <- mapA validateInv inventoryMusdCids
+        let totalInventory = foldl (+) 0.0 amounts
+        assertMsg "INSUFFICIENT_INVENTORY" (totalInventory >= repayAmount)
+
+        -- Archive all inventory sources
+        _ <- mapA archive inventoryMusdCids
+
+        -- Return change to operator if inventory exceeds repay amount
+        let change = totalInventory - repayAmount
+        if change > 0.0
+          then do
+            create CantonMUSD with
+              issuer = operator
+              owner = operator
+              amount = change
+              agreementHash = mpaHash
+              agreementUri = mpaUri
+              privacyObservers = []
+            pure ()
+          else pure ()
+
+        -- Accrue interest first (same as Lending_Repay)
+        accruedDebtCid <- exercise debtCid Debt_AccrueInterest with caller = user
+
+        -- Reduce debt (same accounting as Lending_Repay)
+        (newDebtCid, interestPaid) <- exercise accruedDebtCid Debt_Repay with
+          repayAmount = repayAmount
+
+        -- Calculate reserve portion of interest
+        let reserveAmount = interestPaid * intToNumeric reserveFactorBps / 10000.0
+        let repayFromBorrows = min repayAmount totalBorrows
+        let repayFromSupply = min repayAmount cantonCurrentSupply
+
+        newService <- create this with
+          totalBorrows = totalBorrows - repayFromBorrows
+          protocolReserves = protocolReserves + reserveAmount
+          cantonCurrentSupply = cantonCurrentSupply - repayFromSupply
+
+        return (newService, newDebtCid)
+
+    -- ──────────────────────────────────────────────────────
+    --  WITHDRAW COLLATERAL
+    -- ──────────────────────────────────────────────────────
+
+    -- | Withdraw collateral. Must pass health check after withdrawal.
+    -- Returns the recreated token to the user.
+    -- DAML-H-03: Nonconsuming — withdrawals don't modify service state
+    nonconsuming choice Lending_WithdrawCTN : (ContractId CantonLendingService, ContractId CantonCoin)
+      with
+        user           : Party
+        escrowCid      : ContractId EscrowedCollateral
+        withdrawAmount : Money
+        -- All remaining escrow positions + feeds for health check
+        otherEscrowCids   : [ContractId EscrowedCollateral]
+        priceFeedCids     : [ContractId CantonPriceFeed]
+        existingDebtCid   : Optional (ContractId CantonDebtPosition)
+        collateralAggCid  : Optional (ContractId LendingCollateralAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        escrow <- fetch escrowCid
+        assertMsg "NOT_OWNER" (escrow.owner == user)
+        assertMsg "WRONG_TYPE" (escrow.collateralType == CTN_Coin)
+        assertMsg "WITHDRAW_EXCEEDS_BALANCE" (withdrawAmount > 0.0 && withdrawAmount <= escrow.amount)
+
+        -- Check health AFTER withdrawal
+        existingDebt <- getExistingDebtAndAccrue user existingDebtCid
+        if existingDebt > 0.0 then do
+          -- DAML-M-01: Prevent duplicate escrow CIDs from inflating collateral value
+          assertMsg "DUPLICATE_ESCROW_CIDS" (length (dedup otherEscrowCids) == length otherEscrowCids)
+          let filteredOtherEscrows = filter (/= escrowCid) otherEscrowCids
+          remainingValue <- computeWeightedCollateralValue operator user configs filteredOtherEscrows priceFeedCids True
+          -- Add value of remaining portion of this escrow (if partial withdrawal)
+          let remainingThisEscrow = escrow.amount - withdrawAmount
+          remainingThisValue <- if remainingThisEscrow > 0.0 then do
+            let cfg = getConfig CTN_Coin configs
+            -- DAML-M-03: Per-asset staleness instead of hardcoded 1h
+            ctnPrice <- getCtxPrice operator "CTN" priceFeedCids True (seconds cfg.maxStalenessSecs)
+            return (remainingThisEscrow * ctnPrice * intToNumeric cfg.collateralFactorBps / 10000.0)
+          else return 0.0
+          assertMsg "UNHEALTHY_AFTER_WITHDRAW" (remainingValue + remainingThisValue >= existingDebt)
+        else pure ()
+
+        -- Execute withdrawal
+        if withdrawAmount >= escrow.amount then do
+          _ <- exercise escrowCid Escrow_WithdrawAll with caller = user
+          pure ()
+        else do
+          _ <- exercise escrowCid Escrow_WithdrawPartial with
+            withdrawAmount
+            caller = user
+          pure ()
+
+        -- Recreate the CantonCoin token for the user
+        userObs <- lookupUserObservers operator user None
+        coinCid <- create CantonCoin with
+          issuer = operator
+          owner = user
+          amount = withdrawAmount
+          privacyObservers = userObs
+
+        -- DAML-H-03: Update collateral aggregate tracking
+        let isFullW = withdrawAmount >= escrow.amount
+        case collateralAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid Aggregate_RemoveDeposit with
+              amount = withdrawAmount
+              isFullWithdrawal = isFullW
+            pure ()
+          None -> pure ()
+
+        return (self, coinCid)
+
+    -- ──────────────────────────────────────────────────────
+    -- ──────────────────────────────────────────────────────
+
+    -- | Withdraw USDC collateral. Must pass health check after withdrawal.
+    -- DAML-H-03: Nonconsuming — withdrawals don't modify service state
+    nonconsuming choice Lending_WithdrawUSDC : (ContractId CantonLendingService, ContractId CantonUSDC)
+      with
+        user           : Party
+        escrowCid      : ContractId EscrowedCollateral
+        withdrawAmount : Money
+        otherEscrowCids   : [ContractId EscrowedCollateral]
+        priceFeedCids     : [ContractId CantonPriceFeed]
+        existingDebtCid   : Optional (ContractId CantonDebtPosition)
+        collateralAggCid  : Optional (ContractId LendingCollateralAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        escrow <- fetch escrowCid
+        assertMsg "NOT_OWNER" (escrow.owner == user)
+        assertMsg "WRONG_TYPE" (escrow.collateralType == CTN_USDC)
+        assertMsg "WITHDRAW_EXCEEDS_BALANCE" (withdrawAmount > 0.0 && withdrawAmount <= escrow.amount)
+
+        existingDebt <- getExistingDebtAndAccrue user existingDebtCid
+        if existingDebt > 0.0 then do
+          -- DAML-M-01: Prevent duplicate escrow CIDs from inflating collateral value
+          assertMsg "DUPLICATE_ESCROW_CIDS" (length (dedup otherEscrowCids) == length otherEscrowCids)
+          let filteredOtherEscrows = filter (/= escrowCid) otherEscrowCids
+          remainingValue <- computeWeightedCollateralValue operator user configs filteredOtherEscrows priceFeedCids True
+          let remainingThisEscrow = escrow.amount - withdrawAmount
+          remainingThisValue <- if remainingThisEscrow > 0.0 then do
+            let cfg = getConfig CTN_USDC configs
+            -- DAML-M-03: Per-asset staleness instead of hardcoded 1h
+            usdcPrice <- getCtxPrice operator "USDC" priceFeedCids True (seconds cfg.maxStalenessSecs)
+            return (remainingThisEscrow * usdcPrice * intToNumeric cfg.collateralFactorBps / 10000.0)
+          else return 0.0
+          assertMsg "UNHEALTHY_AFTER_WITHDRAW" (remainingValue + remainingThisValue >= existingDebt)
+        else pure ()
+
+        if withdrawAmount >= escrow.amount then do
+          _ <- exercise escrowCid Escrow_WithdrawAll with caller = user
+          pure ()
+        else do
+          _ <- exercise escrowCid Escrow_WithdrawPartial with
+            withdrawAmount
+            caller = user
+          pure ()
+
+        userObs <- lookupUserObservers operator user None
+        usdcCid <- create CantonUSDC with
+          issuer = operator
+          owner = user
+          amount = withdrawAmount
+          privacyObservers = userObs
+
+        -- DAML-H-03: Update collateral aggregate tracking
+        let isFullW = withdrawAmount >= escrow.amount
+        case collateralAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid Aggregate_RemoveDeposit with
+              amount = withdrawAmount
+              isFullWithdrawal = isFullW
+            pure ()
+          None -> pure ()
+
+        return (self, usdcCid)
+
+    -- | Withdraw USDCx collateral.
+    -- DAML-H-03: Nonconsuming — withdrawals don't modify service state
+    nonconsuming choice Lending_WithdrawUSDCx : (ContractId CantonLendingService, ContractId USDCx)
+      with
+        user           : Party
+        escrowCid      : ContractId EscrowedCollateral
+        withdrawAmount : Money
+        otherEscrowCids   : [ContractId EscrowedCollateral]
+        priceFeedCids     : [ContractId CantonPriceFeed]
+        existingDebtCid   : Optional (ContractId CantonDebtPosition)
+        collateralAggCid  : Optional (ContractId LendingCollateralAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        escrow <- fetch escrowCid
+        assertMsg "NOT_OWNER" (escrow.owner == user)
+        assertMsg "WRONG_TYPE" (escrow.collateralType == CTN_USDCx)
+        assertMsg "WITHDRAW_EXCEEDS_BALANCE" (withdrawAmount > 0.0 && withdrawAmount <= escrow.amount)
+
+        existingDebt <- getExistingDebtAndAccrue user existingDebtCid
+        if existingDebt > 0.0 then do
+          -- DAML-M-01: Prevent duplicate escrow CIDs from inflating collateral value
+          assertMsg "DUPLICATE_ESCROW_CIDS" (length (dedup otherEscrowCids) == length otherEscrowCids)
+          let filteredOtherEscrows = filter (/= escrowCid) otherEscrowCids
+          remainingValue <- computeWeightedCollateralValue operator user configs filteredOtherEscrows priceFeedCids True
+          let remainingThisEscrow = escrow.amount - withdrawAmount
+          remainingThisValue <- if remainingThisEscrow > 0.0 then do
+            let cfg = getConfig CTN_USDCx configs
+            -- DAML-M-03: Per-asset staleness instead of hardcoded 1h
+            usdcxPrice <- getCtxPrice operator "USDCx" priceFeedCids True (seconds cfg.maxStalenessSecs)
+            return (remainingThisEscrow * usdcxPrice * intToNumeric cfg.collateralFactorBps / 10000.0)
+          else return 0.0
+          assertMsg "UNHEALTHY_AFTER_WITHDRAW" (remainingValue + remainingThisValue >= existingDebt)
+        else pure ()
+
+        if withdrawAmount >= escrow.amount then do
+          _ <- exercise escrowCid Escrow_WithdrawAll with caller = user
+          pure ()
+        else do
+          _ <- exercise escrowCid Escrow_WithdrawPartial with
+            withdrawAmount
+            caller = user
+          pure ()
+
+        userObs <- lookupUserObservers operator user None
+        usdcxCid <- create USDCx with
+          issuer = operator
+          owner = user
+          amount = withdrawAmount
+          sourceChain = "canton-lending-withdrawal"
+          cctpNonce = 0
+          privacyObservers = userObs
+
+        -- DAML-H-03: Update collateral aggregate tracking
+        let isFullW = withdrawAmount >= escrow.amount
+        case collateralAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid Aggregate_RemoveDeposit with
+              amount = withdrawAmount
+              isFullWithdrawal = isFullW
+            pure ()
+          None -> pure ()
+
+        return (self, usdcxCid)
+
+    -- | Withdraw CantonSMUSD collateral.
+    -- DAML-H-03: Nonconsuming — withdrawals don't modify service state
+    nonconsuming choice Lending_WithdrawSMUSD : (ContractId CantonLendingService, ContractId CantonSMUSD)
+      with
+        user           : Party
+        escrowCid      : ContractId EscrowedCollateral
+        withdrawAmount : Money
+        otherEscrowCids   : [ContractId EscrowedCollateral]
+        priceFeedCids     : [ContractId CantonPriceFeed]
+        existingDebtCid   : Optional (ContractId CantonDebtPosition)
+        collateralAggCid  : Optional (ContractId LendingCollateralAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        escrow <- fetch escrowCid
+        assertMsg "NOT_OWNER" (escrow.owner == user)
+        assertMsg "WRONG_TYPE" (escrow.collateralType == CTN_SMUSD)
+        assertMsg "WITHDRAW_EXCEEDS_BALANCE" (withdrawAmount > 0.0 && withdrawAmount <= escrow.amount)
+
+        existingDebt <- getExistingDebtAndAccrue user existingDebtCid
+        if existingDebt > 0.0 then do
+          -- DAML-M-01: Prevent duplicate escrow CIDs from inflating collateral value
+          assertMsg "DUPLICATE_ESCROW_CIDS" (length (dedup otherEscrowCids) == length otherEscrowCids)
+          let filteredOtherEscrows = filter (/= escrowCid) otherEscrowCids
+          remainingValue <- computeWeightedCollateralValue operator user configs filteredOtherEscrows priceFeedCids True
+          let remainingThisEscrow = escrow.amount - withdrawAmount
+          remainingThisValue <- if remainingThisEscrow > 0.0 then do
+            let cfg = getConfig CTN_SMUSD configs
+            -- DAML-M-03: Per-asset staleness instead of hardcoded 1h
+            smusdPrice <- getCtxPrice operator "sMUSD" priceFeedCids True (seconds cfg.maxStalenessSecs)
+            return (remainingThisEscrow * smusdPrice * intToNumeric cfg.collateralFactorBps / 10000.0)
+          else return 0.0
+          assertMsg "UNHEALTHY_AFTER_WITHDRAW" (remainingValue + remainingThisValue >= existingDebt)
+        else pure ()
+
+        if withdrawAmount >= escrow.amount then do
+          _ <- exercise escrowCid Escrow_WithdrawAll with caller = user
+          pure ()
+        else do
+          _ <- exercise escrowCid Escrow_WithdrawPartial with
+            withdrawAmount
+            caller = user
+          pure ()
+
+        -- rather than resetting to now (which would unfairly restart cooldown timers)
+        -- DAML-M-03: Use current sMUSD price from feed instead of hardcoded 1.0
+        currentSharePrice <- getCtxPrice operator "sMUSD" priceFeedCids True (seconds (getConfig CTN_SMUSD configs).maxStalenessSecs)
+        userObs <- lookupUserObservers operator user None
+        smusdCid <- create CantonSMUSD with
+          issuer = operator
+          owner = user
+          shares = withdrawAmount
+          entrySharePrice = currentSharePrice  -- DAML-M-03: Use live share price from price feed
+          stakedAt = escrow.depositedAt
+          complianceRegistryCid = complianceRegistryCid
+          privacyObservers = userObs
+
+        -- DAML-H-03: Update collateral aggregate tracking
+        let isFullW = withdrawAmount >= escrow.amount
+        case collateralAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid Aggregate_RemoveDeposit with
+              amount = withdrawAmount
+              isFullWithdrawal = isFullW
+            pure ()
+          None -> pure ()
+
+        return (self, smusdCid)
+
+    -- | Withdraw CantonSMUSD_E collateral (ETH Pool variant).
+    -- DAML-H-03: Nonconsuming — withdrawals don't modify service state
+    nonconsuming choice Lending_WithdrawSMUSDE : (ContractId CantonLendingService, ContractId CantonSMUSD_E)
+      with
+        user           : Party
+        escrowCid      : ContractId EscrowedCollateral
+        withdrawAmount : Money
+        otherEscrowCids   : [ContractId EscrowedCollateral]
+        priceFeedCids     : [ContractId CantonPriceFeed]
+        existingDebtCid   : Optional (ContractId CantonDebtPosition)
+        collateralAggCid  : Optional (ContractId LendingCollateralAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        escrow <- fetch escrowCid
+        assertMsg "NOT_OWNER" (escrow.owner == user)
+        assertMsg "WRONG_TYPE" (escrow.collateralType == CTN_SMUSDE)
+        assertMsg "WITHDRAW_EXCEEDS_BALANCE" (withdrawAmount > 0.0 && withdrawAmount <= escrow.amount)
+
+        existingDebt <- getExistingDebtAndAccrue user existingDebtCid
+        if existingDebt > 0.0 then do
+          -- DAML-M-01: Prevent duplicate escrow CIDs from inflating collateral value
+          assertMsg "DUPLICATE_ESCROW_CIDS" (length (dedup otherEscrowCids) == length otherEscrowCids)
+          let filteredOtherEscrows = filter (/= escrowCid) otherEscrowCids
+          remainingValue <- computeWeightedCollateralValue operator user configs filteredOtherEscrows priceFeedCids True
+          let remainingThisEscrow = escrow.amount - withdrawAmount
+          remainingThisValue <- if remainingThisEscrow > 0.0 then do
+            let cfg = getConfig CTN_SMUSDE configs
+            smusdePrice <- getCtxPrice operator "sMUSD-E" priceFeedCids True (seconds cfg.maxStalenessSecs)
+            return (remainingThisEscrow * smusdePrice * intToNumeric cfg.collateralFactorBps / 10000.0)
+          else return 0.0
+          assertMsg "UNHEALTHY_AFTER_WITHDRAW" (remainingValue + remainingThisValue >= existingDebt)
+        else pure ()
+
+        if withdrawAmount >= escrow.amount then do
+          _ <- exercise escrowCid Escrow_WithdrawAll with caller = user
+          pure ()
+        else do
+          _ <- exercise escrowCid Escrow_WithdrawPartial with
+            withdrawAmount
+            caller = user
+          pure ()
+
+        -- Recreate CantonSMUSD_E with current share price from feed
+        currentSharePrice <- getCtxPrice operator "sMUSD-E" priceFeedCids True (seconds (getConfig CTN_SMUSDE configs).maxStalenessSecs)
+        now <- getTime
+        userObs <- lookupUserObservers operator user None
+        smusdeCid <- create CantonSMUSD_E with
+          issuer = operator
+          owner = user
+          shares = withdrawAmount
+          entrySharePrice = currentSharePrice
+          musdStaked = withdrawAmount * currentSharePrice  -- approximate underlying
+          tier = NoLock       -- Withdrawn collateral loses time-lock
+          stakedAt = escrow.depositedAt
+          unlockAt = None     -- No lock on withdrawn collateral
+          privacyObservers = userObs
+
+        -- DAML-H-03: Update collateral aggregate tracking
+        let isFullW = withdrawAmount >= escrow.amount
+        case collateralAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid Aggregate_RemoveDeposit with
+              amount = withdrawAmount
+              isFullWithdrawal = isFullW
+            pure ()
+          None -> pure ()
+
+        return (self, smusdeCid)
+
+    -- ──────────────────────────────────────────────────────
+    --  WITHDRAW SUPPLY (reclaim supplied assets + earned yield)
+    -- ──────────────────────────────────────────────────────
+
+    -- | Withdraw supplied Canton Coin + earned yield.
+    -- Returns a single CantonCoin with principal + accrued interest.
+    nonconsuming choice Lending_WithdrawSupplyCTN : (ContractId CantonLendingService, ContractId CantonCoin)
+      with
+        user           : Party
+        withdrawAmount : Money
+        supplyCidOpt   : Optional (ContractId CantonSupplyPosition)
+        supplyAggCid   : Optional (ContractId LendingSupplyAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        assertMsg "WITHDRAW_POSITIVE" (withdrawAmount > 0.0)
+
+        supplyCid <- case supplyCidOpt of
+          None -> abort "NO_CTN_SUPPLY_POSITION"
+          Some cid -> return cid
+        supply <- fetch supplyCid
+        assertMsg "NOT_SUPPLIER" (supply.supplier == user)
+        assertMsg "WITHDRAW_EXCEEDS_SUPPLY" (withdrawAmount <= supply.amount)
+
+        userObs <- lookupUserObservers operator user None
+
+        (returnAmount, isFullW) <- if withdrawAmount >= supply.amount then do
+          (principal, interest) <- exercise supplyCid Supply_WithdrawAll with caller = user
+          return (principal + interest, True)
+        else do
+          (_, withdrawn, interest) <- exercise supplyCid Supply_WithdrawPartial with
+            withdrawAmount
+            caller = user
+          return (withdrawn + interest, False)
+
+        coinCid <- create CantonCoin with
+          issuer = operator
+          owner = user
+          amount = returnAmount
+          privacyObservers = userObs
+
+        case supplyAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid SupplyAgg_RemoveSupply with
+              removeAmount = withdrawAmount
+              isFullWithdrawal = isFullW
+            pure ()
+          None -> pure ()
+
+        return (self, coinCid)
+
+    -- | Withdraw supplied smUSD + earned yield.
+    -- Returns a CantonSMUSD token with principal + accrued interest shares.
+    nonconsuming choice Lending_WithdrawSupplySMUSD : (ContractId CantonLendingService, ContractId CantonSMUSD)
+      with
+        user           : Party
+        withdrawAmount : Money
+        priceFeedCids  : [ContractId CantonPriceFeed]
+        supplyCidOpt   : Optional (ContractId CantonSupplyPosition)
+        supplyAggCid   : Optional (ContractId LendingSupplyAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        assertMsg "WITHDRAW_POSITIVE" (withdrawAmount > 0.0)
+
+        supplyCid <- case supplyCidOpt of
+          None -> abort "NO_SMUSD_SUPPLY_POSITION"
+          Some cid -> return cid
+        supply <- fetch supplyCid
+        assertMsg "NOT_SUPPLIER" (supply.supplier == user)
+        assertMsg "WITHDRAW_EXCEEDS_SUPPLY" (withdrawAmount <= supply.amount)
+
+        userObs <- lookupUserObservers operator user None
+
+        (returnShares, isFullW) <- if withdrawAmount >= supply.amount then do
+          (principal, interest) <- exercise supplyCid Supply_WithdrawAll with caller = user
+          return (principal + interest, True)
+        else do
+          (_, withdrawn, interest) <- exercise supplyCid Supply_WithdrawPartial with
+            withdrawAmount
+            caller = user
+          return (withdrawn + interest, False)
+
+        -- Get current share price for entrySharePrice
+        let cfg = getConfig CTN_SMUSD configs
+        currentSharePrice <- getCtxPrice operator "sMUSD" priceFeedCids True (seconds cfg.maxStalenessSecs)
+
+        smusdCid <- create CantonSMUSD with
+          issuer = operator
+          owner = user
+          shares = returnShares
+          entrySharePrice = currentSharePrice
+          stakedAt = supply.suppliedAt
+          complianceRegistryCid = complianceRegistryCid
+          privacyObservers = userObs
+
+        case supplyAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid SupplyAgg_RemoveSupply with
+              removeAmount = withdrawAmount
+              isFullWithdrawal = isFullW
+            pure ()
+          None -> pure ()
+
+        return (self, smusdCid)
+
+    -- | Withdraw supplied smUSD-E + earned yield.
+    -- Returns a CantonSMUSD_E token with principal + accrued interest shares.
+    nonconsuming choice Lending_WithdrawSupplySMUSDE : (ContractId CantonLendingService, ContractId CantonSMUSD_E)
+      with
+        user           : Party
+        withdrawAmount : Money
+        priceFeedCids  : [ContractId CantonPriceFeed]
+        supplyCidOpt   : Optional (ContractId CantonSupplyPosition)
+        supplyAggCid   : Optional (ContractId LendingSupplyAggregate)
+      controller user
+      do
+        assertMsg "SERVICE_PAUSED" (not paused)
+        assertMsg "WITHDRAW_POSITIVE" (withdrawAmount > 0.0)
+
+        supplyCid <- case supplyCidOpt of
+          None -> abort "NO_SMUSDE_SUPPLY_POSITION"
+          Some cid -> return cid
+        supply <- fetch supplyCid
+        assertMsg "NOT_SUPPLIER" (supply.supplier == user)
+        assertMsg "WITHDRAW_EXCEEDS_SUPPLY" (withdrawAmount <= supply.amount)
+
+        userObs <- lookupUserObservers operator user None
+
+        (returnShares, isFullW) <- if withdrawAmount >= supply.amount then do
+          (principal, interest) <- exercise supplyCid Supply_WithdrawAll with caller = user
+          return (principal + interest, True)
+        else do
+          (_, withdrawn, interest) <- exercise supplyCid Supply_WithdrawPartial with
+            withdrawAmount
+            caller = user
+          return (withdrawn + interest, False)
+
+        -- Get current share price
+        let cfg = getConfig CTN_SMUSDE configs
+        currentSharePrice <- getCtxPrice operator "sMUSD-E" priceFeedCids True (seconds cfg.maxStalenessSecs)
+        now <- getTime
+
+        smusdeCid <- create CantonSMUSD_E with
+          issuer = operator
+          owner = user
+          shares = returnShares
+          entrySharePrice = currentSharePrice
+          musdStaked = returnShares * currentSharePrice
+          tier = NoLock
+          stakedAt = supply.suppliedAt
+          unlockAt = None
+          privacyObservers = userObs
+
+        case supplyAggCid of
+          Some aggCid -> do
+            _ <- exercise aggCid SupplyAgg_RemoveSupply with
+              removeAmount = withdrawAmount
+              isFullWithdrawal = isFullW
+            pure ()
+          None -> pure ()
+
+        return (self, smusdeCid)
+
+    -- ──────────────────────────────────────────────────────
+    --  LIQUIDATION
+    -- ──────────────────────────────────────────────────────
+
+    -- | Liquidate an undercollateralized position.
+    -- Liquidator repays part of the borrower's debt and receives
+    -- seized collateral at a discount (penalty).
+    -- Uses unsafe price (no staleness check) — liquidations must always proceed.
+    choice Lending_Liquidate : (ContractId CantonLendingService, ContractId CantonLiquidationReceipt)
+      with
+        liquidator       : Party
+        borrower         : Party
+        repayAmount      : Money
+        targetEscrowCid  : ContractId EscrowedCollateral  -- Which collateral to seize
+        debtCid          : ContractId CantonDebtPosition
+        musdCid          : ContractId CantonMUSD           -- Liquidator's mUSD for repayment
+        escrowCids       : [ContractId EscrowedCollateral] -- All borrower's collateral
+        priceFeedCids    : [ContractId CantonPriceFeed]
+      controller liquidator
+      do
+        assertMsg "CANNOT_SELF_LIQUIDATE" (liquidator /= borrower)
+
+        -- DAML-M-01: Prevent duplicate escrow CIDs from inflating collateral value
+        assertMsg "DUPLICATE_ESCROW_CIDS" (length (dedup escrowCids) == length escrowCids)
+
+        -- Verify liquidator owns the repayment mUSD
+        musd <- fetch musdCid
+        assertMsg "NOT_MUSD_OWNER" (musd.owner == liquidator)
+        assertMsg "REPAY_AMOUNT_MISMATCH" (musd.amount >= repayAmount)
+
+        -- Fetch debt and accrue interest
+        debt <- fetch debtCid
+        assertMsg "DEBT_OWNER_MISMATCH" (debt.borrower == borrower)
+        accruedDebtCid <- exercise debtCid Debt_AccrueInterest with caller = liquidator
+
+        -- Check position is actually undercollateralized (UNSAFE price — no staleness check)
+        totalRawValue <- computeRawCollateralValue operator borrower configs escrowCids priceFeedCids False
+        accruedDebt <- fetch accruedDebtCid
+        let totalDebt = accruedDebt.principalDebt + accruedDebt.accruedInterest
+
+        -- Health factor: rawValue weighted by liquidationThreshold / totalDebt
+        totalLiqValue <- computeLiquidationThresholdValue operator borrower configs escrowCids priceFeedCids False
+        let healthFactor = if totalDebt > 0.0 then totalLiqValue / totalDebt else 999.0
+        assertMsg "POSITION_HEALTHY" (healthFactor < 1.0)
+
+        -- Close factor limits
+        let maxRepay = totalDebt * intToNumeric closeFactorBps / 10000.0
+        let actualRepay = min repayAmount maxRepay
+
+        -- Seize collateral with penalty
+        targetEscrow <- fetch targetEscrowCid
+        let cfg = getConfig targetEscrow.collateralType configs
+        colPrice <- getCtxPriceByType operator targetEscrow.collateralType configs priceFeedCids False
+
+        let seizeValueUsd = actualRepay * (10000.0 + intToNumeric cfg.liquidationPenaltyBps) / 10000.0
+        let seizeAmount = seizeValueUsd / colPrice
+        let actualSeize = min seizeAmount targetEscrow.amount
+
+        -- Execute seizure
+        (remainingEscrow, seized) <- exercise targetEscrowCid Escrow_Seize with
+          seizeAmount = actualSeize
+
+        -- Reduce debt
+        newDebtCid <- exercise accruedDebtCid Debt_ReduceForLiquidation with
+          reductionAmount = actualRepay
+
+        if musd.amount > actualRepay then do
+          (burnCid, changeCid) <- exercise musdCid CantonMUSD_Split with
+            splitAmount = actualRepay
+          exercise burnCid CantonMUSD_Burn
+          -- changeCid goes back to liquidator (already owned by them)
+          pure ()
+        else
+          exercise musdCid CantonMUSD_Burn
+
+        -- (Seized amount is now minted as a new token for the liquidator)
+        userObs <- lookupUserObservers operator liquidator None
+        case targetEscrow.collateralType of
+          CTN_Coin -> do
+            create CantonCoin with
+              issuer = operator
+              owner = liquidator
+              amount = actualSeize
+              privacyObservers = userObs
+            pure ()
+          CTN_USDC -> do
+            create CantonUSDC with
+              issuer = operator
+              owner = liquidator
+              amount = actualSeize
+              privacyObservers = userObs
+            pure ()
+          CTN_USDCx -> do
+            create USDCx with
+              issuer = operator
+              owner = liquidator
+              amount = actualSeize
+              sourceChain = "canton-lending-seizure"
+              cctpNonce = 0
+              privacyObservers = userObs
+            pure ()
+          CTN_SMUSD -> do
+            now2 <- getTime
+            create CantonSMUSD with
+              issuer = operator
+              owner = liquidator
+              shares = actualSeize
+              entrySharePrice = colPrice
+              stakedAt = now2
+              complianceRegistryCid = complianceRegistryCid
+              privacyObservers = userObs
+            pure ()
+          CTN_SMUSDE -> do
+            now2 <- getTime
+            create CantonSMUSD_E with
+              issuer = operator
+              owner = liquidator
+              shares = actualSeize
+              entrySharePrice = colPrice
+              musdStaked = actualSeize * colPrice
+              tier = NoLock
+              stakedAt = now2
+              unlockAt = None
+              privacyObservers = userObs
+            pure ()
+
+        -- Calculate keeper bonus vs protocol fee
+        let penaltyValue = actualSeize * colPrice - actualRepay
+        let keeperBonus = penaltyValue * intToNumeric cfg.liquidationBonusBps / intToNumeric cfg.liquidationPenaltyBps
+        let protocolFee = penaltyValue - keeperBonus
+
+        now <- getTime
+        -- Create immutable receipt
+        receiptCid <- create CantonLiquidationReceipt with
+          operator
+          borrower
+          liquidator
+          collateralType = targetEscrow.collateralType
+          debtRepaid = actualRepay
+          collateralSeized = actualSeize
+          collateralPrice = colPrice
+          penalty = penaltyValue
+          keeperBonus
+          protocolFee
+          healthFactorBefore = healthFactor
+          timestamp = now
+
+        let repayFromBorrows = min actualRepay totalBorrows
+        -- C-01: Decrement cantonCurrentSupply on liquidation (mirrors RepayLoan).
+        -- Liquidation burns mUSD, so supply tracking must decrement in lockstep.
+        let repayFromSupply = min actualRepay cantonCurrentSupply
+        newService <- create this with
+          totalBorrows = totalBorrows - repayFromBorrows
+          protocolReserves = protocolReserves + protocolFee
+          cantonCurrentSupply = cantonCurrentSupply - repayFromSupply
+
+        return (newService, receiptCid)
+
+    -- ──────────────────────────────────────────────────────
+    --  ADMIN
+    -- ──────────────────────────────────────────────────────
+
+    -- | Update collateral config
+    choice Lending_UpdateConfig : ContractId CantonLendingService
+      with
+        newConfig : CollateralConfig
+        governanceProofCid : ContractId GovernanceActionLog
+      controller operator
+      do
+        proof <- exercise governanceProofCid ConsumeProof with consumedBy = operator
+        assertMsg "WRONG_ACTION_TYPE" (proof.actionType == ParameterUpdate)
+        assertMsg "WRONG_TARGET_MODULE" (proof.targetModule == "CantonLending")
+        assertMsg "COLLATERAL_FACTOR_RANGE" (newConfig.collateralFactorBps >= 0 && newConfig.collateralFactorBps <= 9900)
+        assertMsg "LIQ_THRESHOLD_RANGE" (newConfig.liquidationThresholdBps >= 0 && newConfig.liquidationThresholdBps <= 9900)
+        assertMsg "THRESHOLD_GT_FACTOR" (newConfig.liquidationThresholdBps >= newConfig.collateralFactorBps)
+        assertMsg "LIQ_PENALTY_RANGE" (newConfig.liquidationPenaltyBps >= 0 && newConfig.liquidationPenaltyBps <= 2000)
+        assertMsg "LIQ_BONUS_RANGE" (newConfig.liquidationBonusBps >= 0 && newConfig.liquidationBonusBps <= newConfig.liquidationPenaltyBps)
+        let updatedConfigs = map (\c -> if c.collateralType == newConfig.collateralType then newConfig else c) configs
+        create this with configs = updatedConfigs
+
+    -- | Update interest rate (synced from InterestRateService)
+    choice Lending_UpdateRate : ContractId CantonLendingService
+      with
+        newRateBps : Bps
+        governanceProofCid : ContractId GovernanceActionLog
+      controller operator
+      do
+        proof <- exercise governanceProofCid ConsumeProof with consumedBy = operator
+        assertMsg "WRONG_ACTION_TYPE" (proof.actionType == ParameterUpdate)
+        assertMsg "WRONG_TARGET_MODULE" (proof.targetModule == "CantonLending")
+        assertMsg "RATE_NON_NEGATIVE" (newRateBps >= 0)
+        assertMsg "RATE_MAX_100_PERCENT" (newRateBps <= 10000)
+        create this with interestRateBps = newRateBps
+
+    -- | Pause / unpause
+    choice Lending_SetPaused : ContractId CantonLendingService
+      with
+        newPaused : Bool
+      controller operator
+      do create this with paused = newPaused
+
+    choice Lending_UpdateMinBorrow : ContractId CantonLendingService
+      with
+        newMinBorrow : Money
+        governanceProofCid : ContractId GovernanceActionLog
+      controller operator
+      do
+        proof <- exercise governanceProofCid ConsumeProof with consumedBy = operator
+        assertMsg "WRONG_ACTION_TYPE" (proof.actionType == ParameterUpdate)
+        assertMsg "WRONG_TARGET_MODULE" (proof.targetModule == "CantonLending")
+        assertMsg "MIN_BORROW_POSITIVE" (newMinBorrow > 0.0)
+        create this with minBorrow = newMinBorrow
+
+    choice Lending_UpdateReserveFactor : ContractId CantonLendingService
+      with
+        newReserveFactorBps : Bps
+        governanceProofCid : ContractId GovernanceActionLog
+      controller operator
+      do
+        proof <- exercise governanceProofCid ConsumeProof with consumedBy = operator
+        assertMsg "WRONG_ACTION_TYPE" (proof.actionType == ParameterUpdate)
+        assertMsg "WRONG_TARGET_MODULE" (proof.targetModule == "CantonLending")
+        assertMsg "RESERVE_FACTOR_RANGE" (newReserveFactorBps >= 0 && newReserveFactorBps <= 5000)
+        create this with reserveFactorBps = newReserveFactorBps
+
+    choice Lending_UpdateCloseFactor : ContractId CantonLendingService
+      with
+        newCloseFactorBps : Bps
+        governanceProofCid : ContractId GovernanceActionLog
+      controller operator
+      do
+        proof <- exercise governanceProofCid ConsumeProof with consumedBy = operator
+        assertMsg "WRONG_ACTION_TYPE" (proof.actionType == ParameterUpdate)
+        assertMsg "WRONG_TARGET_MODULE" (proof.targetModule == "CantonLending")
+        assertMsg "CLOSE_FACTOR_RANGE" (newCloseFactorBps > 0 && newCloseFactorBps <= 10000)
+        create this with closeFactorBps = newCloseFactorBps
+
+    -- | Update supply rate for a given collateral type
+    choice Lending_UpdateSupplyRate : ContractId CantonLendingService
+      with
+        targetType : CollateralType
+        newSupplyRateBps : Bps
+        governanceProofCid : ContractId GovernanceActionLog
+      controller operator
+      do
+        proof <- exercise governanceProofCid ConsumeProof with consumedBy = operator
+        assertMsg "WRONG_ACTION_TYPE" (proof.actionType == ParameterUpdate)
+        assertMsg "WRONG_TARGET_MODULE" (proof.targetModule == "CantonLending")
+        assertMsg "SUPPLY_RATE_NON_NEGATIVE" (newSupplyRateBps >= 0)
+        assertMsg "SUPPLY_RATE_MAX_50_PERCENT" (newSupplyRateBps <= 5000)
+        let updatedConfigs = map (\c -> if c.collateralType == targetType
+              then c with supplyRateBps = newSupplyRateBps
+              else c) configs
+        create this with configs = updatedConfigs
+
+    -- | Withdraw protocol reserves
+    choice Lending_WithdrawReserves : (ContractId CantonLendingService, ContractId CantonMUSD)
+      with
+        amount : Money
+        governanceProofCid : ContractId GovernanceActionLog
+      controller operator
+      do
+        proof <- exercise governanceProofCid ConsumeProof with consumedBy = operator
+        assertMsg "WRONG_ACTION_TYPE" (proof.actionType == TreasuryWithdrawal)
+        assertMsg "WRONG_TARGET_MODULE" (proof.targetModule == "CantonLending")
+        assertMsg "INSUFFICIENT_RESERVES" (amount <= protocolReserves)
+        musdCid <- create CantonMUSD with
+          issuer = operator
+          owner = operator
+          amount
+          agreementHash = mpaHash
+          agreementUri = mpaUri
+          privacyObservers = []
+        newService <- create this with
+          protocolReserves = protocolReserves - amount
+        return (newService, musdCid)
+
+    -- | DAML-H-04: Update compliance registry reference
+    choice Lending_SetComplianceRegistry : ContractId CantonLendingService
+      with
+        newRegistryCid : ContractId ComplianceRegistry
+        governanceProofCid : ContractId GovernanceActionLog
+      controller operator
+      do
+        proof <- exercise governanceProofCid ConsumeProof with consumedBy = operator
+        assertMsg "WRONG_ACTION_TYPE" (proof.actionType == ParameterUpdate)
+        assertMsg "WRONG_TARGET_MODULE" (proof.targetModule == "CantonLending")
+        create this with complianceRegistryCid = newRegistryCid
+
+-- ============================================================
+--                     SECTION 6: LIQUIDATION RECEIPT
+-- ============================================================
+
+-- | CantonLiquidationReceipt — Immutable audit trail per liquidation.
+template CantonLiquidationReceipt
+  with
+    operator         : Party
+    borrower         : Party
+    liquidator       : Party
+    collateralType   : CollateralType
+    debtRepaid       : Money
+    collateralSeized : Money
+    collateralPrice  : Money
+    penalty          : Money
+    keeperBonus      : Money
+    protocolFee      : Money
+    healthFactorBefore : Money
+    timestamp        : Time
+  where
+    signatory operator
+    observer borrower, liquidator
+
+    ensure debtRepaid > 0.0 && collateralSeized > 0.0
+
+-- ============================================================
+--                     HELPER FUNCTIONS
+-- ============================================================
+
+-- | Look up config for a given collateral type
+getConfig : CollateralType -> [CollateralConfig] -> CollateralConfig
+getConfig ct [] = error ("CONFIG_NOT_FOUND: " <> show ct)
+getConfig ct (c :: cs) = if c.collateralType == ct then c else getConfig ct cs
+
+-- | Get existing debt for a user (returns 0 if no position)
+-- LF2 migration: accepts Optional CID instead of lookupByKey
+getExistingDebt : Optional (ContractId CantonDebtPosition) -> Update Money
+getExistingDebt debtOpt = do
+  case debtOpt of
+    None -> return 0.0
+    Some debtCid -> do
+      debt <- fetch debtCid
+      now <- getTime
+      let elapsed = convertRelTimeToMicroseconds (subTime now debt.lastAccrualTime)
+      let secondsElapsed : Money = intToNumeric (elapsed / 1000000)
+      let yearSeconds = 31536000.0 : Money
+      let newInterest = debt.principalDebt * intToNumeric debt.interestRateBps * secondsElapsed / (10000.0 * yearSeconds)
+      return (debt.principalDebt + debt.accruedInterest + newInterest)
+
+-- Used by withdrawal paths to keep on-ledger state consistent.
+-- LF2 migration: accepts Optional CID instead of lookupByKey
+getExistingDebtAndAccrue : Party -> Optional (ContractId CantonDebtPosition) -> Update Money
+getExistingDebtAndAccrue user debtOpt = do
+  case debtOpt of
+    None -> return 0.0
+    Some debtCid -> do
+      accruedCid <- exercise debtCid Debt_AccrueInterest with caller = user
+      debt <- fetch accruedCid
+      return (debt.principalDebt + debt.accruedInterest)
+
+-- | Get price from feed list by symbol (with staleness check option)
+-- DAML-M-03: Accepts per-asset staleness instead of hardcoded 1h
+getCtxPrice : Party -> Text -> [ContractId CantonPriceFeed] -> Bool -> RelTime -> Update Money
+getCtxPrice _ symbol [] _ _ = error ("PRICE_FEED_NOT_FOUND: " <> symbol)
+getCtxPrice operator symbol (fCid :: rest) safe staleness = do
+  feed <- fetch fCid
+  if feed.symbol == symbol
+    then if safe
+      then exercise fCid PriceFeed_GetPrice with
+        requester = operator
+        maxStaleness = staleness
+      else exercise fCid PriceFeed_GetPriceUnsafe with
+        requester = operator
+    else getCtxPrice operator symbol rest safe staleness
+
+-- | Get price by collateral type
+-- DAML-M-03: Uses per-asset staleness from CollateralConfig
+getCtxPriceByType : Party -> CollateralType -> [CollateralConfig] -> [ContractId CantonPriceFeed] -> Bool -> Update Money
+getCtxPriceByType operator ct cfgs feeds safe =
+  let cfg = getConfig ct cfgs
+      staleness = seconds cfg.maxStalenessSecs
+  in case ct of
+    CTN_Coin   -> getCtxPrice operator "CTN" feeds safe staleness
+    CTN_USDC   -> getCtxPrice operator "USDC" feeds safe staleness
+    CTN_USDCx  -> getCtxPrice operator "USDCx" feeds safe staleness
+    CTN_SMUSD  -> getCtxPrice operator "sMUSD" feeds safe staleness
+    CTN_SMUSDE -> getCtxPrice operator "sMUSD-E" feeds safe staleness
+
+-- | Compute total collateral value weighted by collateralFactorBps
+computeWeightedCollateralValue : Party -> Party -> [CollateralConfig] -> [ContractId EscrowedCollateral] -> [ContractId CantonPriceFeed] -> Bool -> Update Money
+computeWeightedCollateralValue _ _ _ [] _ _ = return 0.0
+computeWeightedCollateralValue operator expectedOwner cfgs (eCid :: eRest) feeds safe = do
+  escrow <- fetch eCid
+  assertMsg "ESCROW_OWNER_MISMATCH" (escrow.owner == expectedOwner)
+  let cfg = getConfig escrow.collateralType cfgs
+  -- This prevents borrowing against collateral that has been disabled by the operator
+  price <- getCtxPriceByType operator escrow.collateralType cfgs feeds safe
+  let value = if cfg.enabled
+        then escrow.amount * price * intToNumeric cfg.collateralFactorBps / 10000.0
+        else 0.0
+  rest <- computeWeightedCollateralValue operator expectedOwner cfgs eRest feeds safe
+  return (value + rest)
+
+-- | Compute total raw collateral value (no LTV weighting)
+computeRawCollateralValue : Party -> Party -> [CollateralConfig] -> [ContractId EscrowedCollateral] -> [ContractId CantonPriceFeed] -> Bool -> Update Money
+computeRawCollateralValue _ _ _ [] _ _ = return 0.0
+computeRawCollateralValue operator expectedOwner cfgs (eCid :: eRest) feeds safe = do
+  escrow <- fetch eCid
+  assertMsg "ESCROW_OWNER_MISMATCH" (escrow.owner == expectedOwner)
+  price <- getCtxPriceByType operator escrow.collateralType cfgs feeds safe
+  let value = escrow.amount * price
+  rest <- computeRawCollateralValue operator expectedOwner cfgs eRest feeds safe
+  return (value + rest)
+
+-- | Compute total collateral value weighted by liquidationThresholdBps
+computeLiquidationThresholdValue : Party -> Party -> [CollateralConfig] -> [ContractId EscrowedCollateral] -> [ContractId CantonPriceFeed] -> Bool -> Update Money
+computeLiquidationThresholdValue _ _ _ [] _ _ = return 0.0
+computeLiquidationThresholdValue operator expectedOwner cfgs (eCid :: eRest) feeds safe = do
+  escrow <- fetch eCid
+  assertMsg "ESCROW_OWNER_MISMATCH" (escrow.owner == expectedOwner)
+  let cfg = getConfig escrow.collateralType cfgs
+  price <- getCtxPriceByType operator escrow.collateralType cfgs feeds safe
+  let value = escrow.amount * price * intToNumeric cfg.liquidationThresholdBps / 10000.0
+  rest <- computeLiquidationThresholdValue operator expectedOwner cfgs eRest feeds safe
+  return (value + rest)

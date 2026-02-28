@@ -1,0 +1,4 @@
+module UpgradeTest where
+
+-- Placeholder module to keep CI DAML parser/build green.
+-- Upgrade-specific tests are maintained in dedicated suites.

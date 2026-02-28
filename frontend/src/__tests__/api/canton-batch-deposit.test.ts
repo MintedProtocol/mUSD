@@ -51,7 +51,7 @@ async function loadHandler() {
   process.env.CANTON_LENDING_PACKAGE_ID = TEST_LENDING_PKG;
   process.env.CANTON_PARTY = TEST_PARTY;
   process.env.CANTON_TOKEN = "test-token";
-  return (await import("../canton-batch-deposit")).default as (
+  return (await import("@/pages/api/canton-batch-deposit")).default as (
     req: import("next").NextApiRequest,
     res: import("next").NextApiResponse
   ) => Promise<void>;

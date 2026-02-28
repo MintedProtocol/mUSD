@@ -54,7 +54,7 @@ async function loadHandler() {
   process.env.CANTON_PACKAGE_ID = TEST_PKG;
   process.env.CANTON_PARTY = TEST_PARTY;
   process.env.CANTON_TOKEN = "test-token";
-  return (await import("../canton-batch-unstake")).default as (
+  return (await import("@/pages/api/canton-batch-unstake")).default as (
     req: import("next").NextApiRequest,
     res: import("next").NextApiResponse
   ) => Promise<void>;
@@ -322,6 +322,45 @@ describe("/api/canton-batch-unstake", () => {
     );
     expect(data.statusCode).toBe(400);
     expect((data.body as Record<string, unknown>).errorType).toBe("SERVICE_PAUSED");
+  });
+
+  it("classifies Canton LAST_STAKER_PARTIAL_FORBIDDEN error", async () => {
+    process.env.ENABLE_BATCH_CHOICES = "true";
+    const handler = await loadHandler();
+    mockFetch
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ offset: "1000" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => [
+          {
+            contractEntry: {
+              JsActiveContract: {
+                createdEvent: {
+                  contractId: "svc-001",
+                  templateId: `${TEST_PKG}:CantonETHPool:CantonETHPoolService`,
+                },
+              },
+            },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        text: async () => "assertion failed: LAST_STAKER_PARTIAL_FORBIDDEN",
+      });
+    const { res, data } = makeRes();
+    await handler(
+      makeReq({
+        party: TEST_PARTY,
+        pool: "ethpool",
+        contractIds: ["abc123"],
+        requestedMusd: "100",
+      }),
+      res
+    );
+    expect(data.statusCode).toBe(400);
+    expect((data.body as Record<string, unknown>).errorType).toBe("LAST_STAKER_PARTIAL_FORBIDDEN");
   });
 
   it("returns 500 when CANTON_PARTY is not configured", async () => {

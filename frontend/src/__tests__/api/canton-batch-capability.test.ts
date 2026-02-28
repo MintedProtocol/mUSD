@@ -36,7 +36,7 @@ function makeRes() {
 
 async function loadHandler() {
   vi.resetModules();
-  return (await import("../canton-batch-capability")).default as (
+  return (await import("@/pages/api/canton-batch-capability")).default as (
     req: import("next").NextApiRequest,
     res: import("next").NextApiResponse
   ) => Promise<void>;

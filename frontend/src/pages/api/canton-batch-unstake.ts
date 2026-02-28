@@ -260,6 +260,7 @@ function classifyErrorType(message: string): string {
   if (message.includes("INSUFFICIENT_BALANCE")) return "INSUFFICIENT_BALANCE";
   if (message.includes("UNSTAKE_EXCEEDS_MUSD_MINT_CAP")) return "UNSTAKE_EXCEEDS_MUSD_MINT_CAP";
   if (message.includes("REQUESTED_AMOUNT_POSITIVE")) return "REQUESTED_AMOUNT_POSITIVE";
+  if (message.includes("LAST_STAKER_PARTIAL_FORBIDDEN")) return "LAST_STAKER_PARTIAL_FORBIDDEN";
   return "CANTON_ERROR";
 }
 

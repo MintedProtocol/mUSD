@@ -855,7 +855,7 @@ export function CantonStake() {
                           <label className="text-sm font-medium text-gray-400">Deposit Asset</label>
                           <div className="grid grid-cols-3 gap-2">
                             {(["USDC", "USDCx", "CTN"] as DepositAsset[]).map(asset => (
-                              <button key={asset} onClick={() => { setDepositAsset(asset); setSelectedAssetIdx(0); setAmount(""); }}
+                              <button key={asset} onClick={() => { setDepositAsset(asset); setAmount(""); }}
                                 className={`rounded-xl border px-4 py-3 text-sm font-semibold transition-all ${depositAsset === asset ? "border-blue-500 bg-blue-500/20 text-white" : "border-white/10 bg-surface-800/50 text-gray-400 hover:border-white/30 hover:text-white"}`}>
                                 {asset}
                               </button>

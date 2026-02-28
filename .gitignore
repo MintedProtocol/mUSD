@@ -2,4 +2,6 @@
 node_modules/
 dist/
 .next/
+.next.broken.*/
 *.tsbuildinfo
+*.log

@@ -607,3 +607,65 @@ describe("selectMinForfeitCoveringCids", () => {
     expect(selectMinForfeitCoveringCids(tokens, 100)).toEqual(["cid1"]);
   });
 });
+
+// ── Guard parity: selected CIDs vs total shares ─────────────────────────
+
+describe("last-staker guard with selected CIDs (parity fix)", () => {
+  it("allows partial unstake when selected CIDs are a subset of total shares", () => {
+    // User has 1000 shares across 4 tokens (250 each), pool total = 1000.
+    // Requesting 200 smUSD → selectMinForfeitCoveringCids picks 1 token (250).
+    // selectedShares = 250, poolTotal = 1000 → NOT last staker → allowed.
+    const tokens = [
+      makeToken("a", 250), makeToken("b", 250),
+      makeToken("c", 250), makeToken("d", 250),
+    ];
+    const requested = 200;
+    const cids = selectMinForfeitCoveringCids(tokens, requested);
+    expect(cids).toHaveLength(1); // picks smallest covering (250)
+
+    const selectedShares = tokens
+      .filter((t) => cids.includes(t.contractId))
+      .reduce((s, t) => s + parseFloat(t.amount), 0);
+    expect(selectedShares).toBe(250);
+
+    // With old bug (total shares = 1000): would block (last staker + partial)
+    // With fix (selected shares = 250): NOT last staker → allowed
+    const poolTotal = 1000;
+    const sharePrice = 1;
+    const requestedMusd = requested * sharePrice;
+    const pooledMusd = 1000;
+    expect(isLastStakerPartialForbidden(selectedShares, poolTotal, requestedMusd, pooledMusd)).toBe(false);
+    // Prove old logic would have blocked:
+    expect(isLastStakerPartialForbidden(1000, poolTotal, requestedMusd, pooledMusd)).toBe(true);
+  });
+
+  it("blocks when selected CIDs consume all pool shares and request is partial", () => {
+    // Single user, single token of 1000 = all pool shares.
+    // Requesting 800 (partial). Selected CIDs = ["a"] with 1000 shares.
+    const tokens = [makeToken("a", 1000)];
+    const requested = 800;
+    const cids = selectMinForfeitCoveringCids(tokens, requested);
+    expect(cids).toEqual(["a"]);
+
+    const selectedShares = 1000;
+    const poolTotal = 1000;
+    const requestedMusd = 800; // partial
+    const pooledMusd = 1000;
+    expect(isLastStakerPartialForbidden(selectedShares, poolTotal, requestedMusd, pooledMusd)).toBe(true);
+  });
+
+  it("allows full-vault request when selected CIDs consume all shares", () => {
+    // Single user, single token of 1000 = all pool shares.
+    // Requesting full 1000 → not partial → allowed.
+    const tokens = [makeToken("a", 1000)];
+    const requested = 1000;
+    const cids = selectMinForfeitCoveringCids(tokens, requested);
+    expect(cids).toEqual(["a"]);
+
+    const selectedShares = 1000;
+    const poolTotal = 1000;
+    const requestedMusd = 1000; // full
+    const pooledMusd = 1000;
+    expect(isLastStakerPartialForbidden(selectedShares, poolTotal, requestedMusd, pooledMusd)).toBe(false);
+  });
+});

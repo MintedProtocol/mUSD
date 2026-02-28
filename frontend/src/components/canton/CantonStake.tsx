@@ -271,20 +271,22 @@ export function CantonStake() {
 
       if (OPTION2_BATCH_ENABLED) {
         // ── Option 2: batch unstake path ──
-        const userShares = freshSmusd.reduce((s, t) => s + parseTokenAmount(t), 0);
         const poolTotal = parseFloat(freshService.totalShares || "0");
         const sharePrice = parseFloat(freshService.sharePrice || "1");
         const requestedMusd = parsedAmount * sharePrice;
         const pooledMusd = parseFloat(freshService.pooledMusd || "0");
 
-        // Pre-submit: last-staker partial guard
-        if (isLastStakerPartialForbidden(userShares, poolTotal, requestedMusd, pooledMusd)) {
-          throw new Error(mapBatchUnstakeError("LAST_STAKER_PARTIAL_FORBIDDEN", "Partial unstake blocked"));
-        }
-
-        // Select least-forfeit covering CID set
+        // Select least-forfeit covering CID set first (needed for guard)
         const cids = selectMinForfeitCoveringCids(freshSmusd, parsedAmount);
         if (cids.length === 0) throw new Error("No smUSD shares available.");
+
+        // Pre-submit: last-staker partial guard using only selected CID shares
+        const selectedShares = freshSmusd
+          .filter((t) => cids.includes(t.contractId))
+          .reduce((s, t) => s + parseTokenAmount(t), 0);
+        if (isLastStakerPartialForbidden(selectedShares, poolTotal, requestedMusd, pooledMusd)) {
+          throw new Error(mapBatchUnstakeError("LAST_STAKER_PARTIAL_FORBIDDEN", "Partial unstake blocked"));
+        }
 
         // Submit to batch endpoint
         const resp = await fetch("/api/canton-batch-unstake", {

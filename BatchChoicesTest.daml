@@ -65,7 +65,7 @@ setupParties = do
   bob      <- allocateParty "Bob"
   regulator <- allocateParty "Regulator"
   setTime (datetime 2026 Jan 1 0 0 0)
-  regCid <- submitMulti [regulator] [] do
+  regCid <- submit regulator do
     createCmd ComplianceRegistry with
       regulator
       operator
@@ -78,7 +78,7 @@ setupParties = do
 -- CantonMUSD is signatory issuer + owner, so we need both parties.
 mintMusd : Party -> Party -> Money -> Script (ContractId CantonMUSD)
 mintMusd operator user amount = do
-  submitMulti [operator, user] [] do
+  submit (actAs [operator, user]) do
     createCmd CantonMUSD with
       issuer        = operator
       owner         = user
@@ -214,13 +214,13 @@ test_ETHPool_BatchUnstake_HappyPath = script do
   m3 <- mintMusd operator alice 100.0
 
   -- Stake each individually to get 3 separate smUSD-E positions
-  (poolSvcCid2, e1) <- submitMulti [alice] [operator] do
+  (poolSvcCid2, e1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid ETHPool_Stake with
       user = alice; musdCid = m1; selectedTier = NoLock
-  (poolSvcCid3, e2) <- submitMulti [alice] [operator] do
+  (poolSvcCid3, e2) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid2 ETHPool_Stake with
       user = alice; musdCid = m2; selectedTier = NoLock
-  (poolSvcCid4, e3) <- submitMulti [alice] [operator] do
+  (poolSvcCid4, e3) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid3 ETHPool_Stake with
       user = alice; musdCid = m3; selectedTier = NoLock
 
@@ -231,7 +231,7 @@ test_ETHPool_BatchUnstake_HappyPath = script do
   assertMsg "300 mUSD staked"  (s.totalMusdStaked == 300.0)
 
   -- Batch unstake all 3 positions, requesting exactly 300 mUSD
-  (poolSvcCid5, musdOut) <- submitMulti [alice] [operator] do
+  (poolSvcCid5, musdOut) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid4 ETHPool_BatchUnstake with
       user          = alice
       smusdeCids    = [e1, e2, e3]
@@ -265,11 +265,11 @@ test_Staking_UnstakeBatch_HappyPath = script do
   m2 <- mintMusd operator alice 100.0
   m3 <- mintMusd operator alice 100.0
 
-  (svc2, s1) <- submitMulti [alice] [operator] do
+  (svc2, s1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd stakeSvcCid Stake with user = alice; musdCid = m1
-  (svc3, s2) <- submitMulti [alice] [operator] do
+  (svc3, s2) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd svc2 Stake with user = alice; musdCid = m2
-  (svc4, s3) <- submitMulti [alice] [operator] do
+  (svc4, s3) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd svc3 Stake with user = alice; musdCid = m3
 
   -- Verify pool: 300 shares, 300 mUSD pooled
@@ -279,7 +279,7 @@ test_Staking_UnstakeBatch_HappyPath = script do
   assertMsg "300 mUSD in pool"  (p.pooledMusd == 300.0)
 
   -- Batch unstake requesting 300 mUSD
-  (svc5, musdOut) <- submitMulti [alice] [operator] do
+  (svc5, musdOut) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd svc4 Unstake_Batch with
       user          = alice
       smusdCids     = [s1, s2, s3]
@@ -312,15 +312,15 @@ test_Lending_BatchDepositSMUSD_HappyPath = script do
   m2 <- mintMusd operator alice 100.0
   m3 <- mintMusd operator alice 100.0
 
-  (svc2, s1) <- submitMulti [alice] [operator] do
+  (svc2, s1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd stakeSvcCid Stake with user = alice; musdCid = m1
-  (svc3, s2) <- submitMulti [alice] [operator] do
+  (svc3, s2) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd svc2 Stake with user = alice; musdCid = m2
-  (_svc4, s3) <- submitMulti [alice] [operator] do
+  (_svc4, s3) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd svc3 Stake with user = alice; musdCid = m3
 
   -- Batch deposit all 3 smUSD as collateral
-  (_lendSvcCid2, escrowCid) <- submitMulti [alice] [operator] do
+  (_lendSvcCid2, escrowCid) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd lendSvcCid Lending_BatchDepositSMUSD with
       user              = alice
       smusdCids         = [s1, s2, s3]
@@ -351,15 +351,15 @@ test_Lending_BatchDepositSMUSDE_HappyPath = script do
   m1 <- mintMusd operator alice 150.0
   m2 <- mintMusd operator alice 150.0
 
-  (poolSvcCid2, e1) <- submitMulti [alice] [operator] do
+  (poolSvcCid2, e1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid ETHPool_Stake with
       user = alice; musdCid = m1; selectedTier = NoLock
-  (_poolSvcCid3, e2) <- submitMulti [alice] [operator] do
+  (_poolSvcCid3, e2) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid2 ETHPool_Stake with
       user = alice; musdCid = m2; selectedTier = NoLock
 
   -- Batch deposit both smUSD-E as collateral
-  (_lendSvcCid2, escrowCid) <- submitMulti [alice] [operator] do
+  (_lendSvcCid2, escrowCid) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd lendSvcCid Lending_BatchDepositSMUSDE with
       user              = alice
       smusdeCids        = [e1, e2]
@@ -385,12 +385,12 @@ test_ETHPool_BatchUnstake_InsufficientBalance = script do
   poolSvcCid <- createPoolService operator regCid
 
   m1 <- mintMusd operator alice 100.0
-  (poolSvcCid2, e1) <- submitMulti [alice] [operator] do
+  (poolSvcCid2, e1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid ETHPool_Stake with
       user = alice; musdCid = m1; selectedTier = NoLock
 
   -- Try to unstake more than available → must fail
-  submitMultiMustFail [alice] [operator] do
+  submitMustFail (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid2 ETHPool_BatchUnstake with
       user          = alice
       smusdeCids    = [e1]
@@ -408,10 +408,10 @@ test_Staking_UnstakeBatch_InsufficientBalance = script do
   stakeSvcCid <- createStakingService operator regCid
 
   m1 <- mintMusd operator alice 100.0
-  (svc2, s1) <- submitMulti [alice] [operator] do
+  (svc2, s1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd stakeSvcCid Stake with user = alice; musdCid = m1
 
-  submitMultiMustFail [alice] [operator] do
+  submitMustFail (actAs alice <> readAs [operator]) do
     exerciseCmd svc2 Unstake_Batch with
       user          = alice
       smusdCids     = [s1]
@@ -433,15 +433,15 @@ test_ETHPool_BatchUnstake_MixedOwner = script do
   mA <- mintMusd operator alice 100.0
   mB <- mintMusd operator bob   100.0
 
-  (poolSvcCid2, eAlice) <- submitMulti [alice] [operator] do
+  (poolSvcCid2, eAlice) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid ETHPool_Stake with
       user = alice; musdCid = mA; selectedTier = NoLock
-  (poolSvcCid3, eBob) <- submitMulti [bob] [operator] do
+  (poolSvcCid3, eBob) <- submit (actAs bob <> readAs [operator]) do
     exerciseCmd poolSvcCid2 ETHPool_Stake with
       user = bob; musdCid = mB; selectedTier = NoLock
 
   -- Alice tries to unstake both her token AND Bob's → must fail
-  submitMultiMustFail [alice] [operator] do
+  submitMustFail (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid3 ETHPool_BatchUnstake with
       user          = alice
       smusdeCids    = [eAlice, eBob]   -- eBob is not owned by Alice
@@ -462,12 +462,12 @@ test_Lending_BatchDepositSMUSD_MixedOwner = script do
   mA <- mintMusd operator alice 100.0
   mB <- mintMusd operator bob   100.0
 
-  (svc2, sAlice) <- submitMulti [alice] [operator] do
+  (svc2, sAlice) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd stakeSvcCid Stake with user = alice; musdCid = mA
-  (_svc3, sBob) <- submitMulti [bob] [operator] do
+  (_svc3, sBob) <- submit (actAs bob <> readAs [operator]) do
     exerciseCmd svc2 Stake with user = bob; musdCid = mB
 
-  submitMultiMustFail [alice] [operator] do
+  submitMustFail (actAs alice <> readAs [operator]) do
     exerciseCmd lendSvcCid Lending_BatchDepositSMUSD with
       user              = alice
       smusdCids         = [sAlice, sBob]   -- sBob not owned by Alice
@@ -486,7 +486,7 @@ test_ETHPool_BatchUnstake_Paused = script do
   poolSvcCid <- createPoolService operator regCid
 
   m1 <- mintMusd operator alice 100.0
-  (poolSvcCid2, e1) <- submitMulti [alice] [operator] do
+  (poolSvcCid2, e1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid ETHPool_Stake with
       user = alice; musdCid = m1; selectedTier = NoLock
 
@@ -495,7 +495,7 @@ test_ETHPool_BatchUnstake_Paused = script do
     exerciseCmd poolSvcCid2 ETHPool_SetPaused with newPaused = True
 
   -- Batch unstake on paused service → must fail
-  submitMultiMustFail [alice] [operator] do
+  submitMustFail (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid3 ETHPool_BatchUnstake with
       user          = alice
       smusdeCids    = [e1]
@@ -513,13 +513,13 @@ test_Staking_UnstakeBatch_Paused = script do
   stakeSvcCid <- createStakingService operator regCid
 
   m1 <- mintMusd operator alice 100.0
-  (svc2, s1) <- submitMulti [alice] [operator] do
+  (svc2, s1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd stakeSvcCid Stake with user = alice; musdCid = m1
 
   svc3 <- submit operator do
     exerciseCmd svc2 Staking_SetPaused with newPaused = True
 
-  submitMultiMustFail [alice] [operator] do
+  submitMustFail (actAs alice <> readAs [operator]) do
     exerciseCmd svc3 Unstake_Batch with
       user          = alice
       smusdCids     = [s1]
@@ -536,7 +536,7 @@ test_ETHPool_BatchUnstake_EmptyList = script do
   (operator, alice, _bob, regCid) <- setupParties
   poolSvcCid <- createPoolService operator regCid
 
-  submitMultiMustFail [alice] [operator] do
+  submitMustFail (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid ETHPool_BatchUnstake with
       user          = alice
       smusdeCids    = []
@@ -553,7 +553,7 @@ test_Staking_UnstakeBatch_EmptyList = script do
   (operator, alice, _bob, regCid) <- setupParties
   stakeSvcCid <- createStakingService operator regCid
 
-  submitMultiMustFail [alice] [operator] do
+  submitMustFail (actAs alice <> readAs [operator]) do
     exerciseCmd stakeSvcCid Unstake_Batch with
       user          = alice
       smusdCids     = []
@@ -576,12 +576,12 @@ test_Lending_BatchDepositSMUSD_Idempotency = script do
   -- First batch: 2 × 100
   m1 <- mintMusd operator alice 100.0
   m2 <- mintMusd operator alice 100.0
-  (svc2, s1) <- submitMulti [alice] [operator] do
+  (svc2, s1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd stakeSvcCid Stake with user = alice; musdCid = m1
-  (svc3, s2) <- submitMulti [alice] [operator] do
+  (svc3, s2) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd svc2 Stake with user = alice; musdCid = m2
 
-  (_lendSvcCid2, escrowCid1) <- submitMulti [alice] [operator] do
+  (_lendSvcCid2, escrowCid1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd lendSvcCid Lending_BatchDepositSMUSD with
       user              = alice
       smusdCids         = [s1, s2]
@@ -593,11 +593,11 @@ test_Lending_BatchDepositSMUSD_Idempotency = script do
 
   -- Second batch: 1 × 100, adding to existing escrow
   m3 <- mintMusd operator alice 100.0
-  (_svc4, s3) <- submitMulti [alice] [operator] do
+  (_svc4, s3) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd svc3 Stake with user = alice; musdCid = m3
 
   -- Note: Lending_BatchDepositSMUSD is nonconsuming, so lendSvcCid is still valid
-  (_lendSvcCid3, escrowCid2) <- submitMulti [alice] [operator] do
+  (_lendSvcCid3, escrowCid2) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd lendSvcCid Lending_BatchDepositSMUSD with
       user              = alice
       smusdCids         = [s3]
@@ -624,18 +624,18 @@ test_ETHPool_BatchUnstake_PartialRequest = script do
   m2 <- mintMusd operator alice 100.0
   m3 <- mintMusd operator alice 100.0
 
-  (poolSvcCid2, e1) <- submitMulti [alice] [operator] do
+  (poolSvcCid2, e1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid ETHPool_Stake with
       user = alice; musdCid = m1; selectedTier = NoLock
-  (poolSvcCid3, e2) <- submitMulti [alice] [operator] do
+  (poolSvcCid3, e2) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid2 ETHPool_Stake with
       user = alice; musdCid = m2; selectedTier = NoLock
-  (poolSvcCid4, e3) <- submitMulti [alice] [operator] do
+  (poolSvcCid4, e3) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid3 ETHPool_Stake with
       user = alice; musdCid = m3; selectedTier = NoLock
 
   -- Request only 150 mUSD from 300 worth of tokens
-  (poolSvcCid5, musdOut) <- submitMulti [alice] [operator] do
+  (poolSvcCid5, musdOut) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid4 ETHPool_BatchUnstake with
       user          = alice
       smusdeCids    = [e1, e2, e3]
@@ -672,19 +672,19 @@ test_ETHPool_BatchUnstake_ForfeitGovPolicy = script do
   m1 <- mintMusd operator alice 100.0
   m2 <- mintMusd operator alice 100.0
   m3 <- mintMusd operator alice 100.0
-  (poolSvcCid2, e1) <- submitMulti [alice] [operator] do
+  (poolSvcCid2, e1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid ETHPool_Stake with
       user = alice; musdCid = m1; selectedTier = NoLock
-  (poolSvcCid3, e2) <- submitMulti [alice] [operator] do
+  (poolSvcCid3, e2) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid2 ETHPool_Stake with
       user = alice; musdCid = m2; selectedTier = NoLock
-  (poolSvcCid4, e3) <- submitMulti [alice] [operator] do
+  (poolSvcCid4, e3) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid3 ETHPool_Stake with
       user = alice; musdCid = m3; selectedTier = NoLock
 
   -- Request only 150 mUSD from positions worth 300 mUSD combined.
   -- FORFEIT POLICY: all 3 tokens are archived; user gets exactly 150 mUSD.
-  (poolSvcCid5, musdOut) <- submitMulti [alice] [operator] do
+  (poolSvcCid5, musdOut) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd poolSvcCid4 ETHPool_BatchUnstake with
       user          = alice
       smusdeCids    = [e1, e2, e3]
@@ -716,16 +716,6 @@ test_ETHPool_BatchUnstake_ForfeitGovPolicy = script do
   debug "✅ 15. FORFEIT POLICY (ETHPool): all tokens archived, user gets exactly requestedMusd, excess shares destroyed"
 
 -- ============================================================
--- 16. FORFEIT GOVERNANCE POLICY — Unstake_Batch (vault model)
--- Dedicated test proving INTENTIONAL forfeit semantics for the
--- vault (CantonStakingService) path:
---   - All provided smUSD tokens archived.
---   - User receives EXACTLY requestedMusd from vault.
---   - Remaining vault holds the excess mUSD (benefits other stakers).
---   - All provided shares are burned (not just requestedMusd / sharePrice worth).
--- ============================================================
-
--- ============================================================
 -- 16. LAST_STAKER_PARTIAL_FORBIDDEN guard (Vault / Unstake_Batch)
 -- Proves that consuming all outstanding shares while leaving vault residual
 -- is rejected. The last staker must either request the full vault balance
@@ -742,17 +732,17 @@ test_Staking_UnstakeBatch_LastStakerPartialForbidden = script do
   m1 <- mintMusd operator alice 100.0
   m2 <- mintMusd operator alice 100.0
   m3 <- mintMusd operator alice 100.0
-  (svc2, s1) <- submitMulti [alice] [operator] do
+  (svc2, s1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd stakeSvcCid Stake with user = alice; musdCid = m1
-  (svc3, s2) <- submitMulti [alice] [operator] do
+  (svc3, s2) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd svc2 Stake with user = alice; musdCid = m2
-  (svc4, s3) <- submitMulti [alice] [operator] do
+  (svc4, s3) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd svc3 Stake with user = alice; musdCid = m3
 
   -- Attempt: provide all 300 shares but only request 150 mUSD.
   -- This would leave totalShares=0, pooledMusd=150 — an orphaned vault.
   -- Must fail with LAST_STAKER_PARTIAL_FORBIDDEN.
-  submitMultiMustFail [alice] [operator] do
+  submitMustFail (actAs alice <> readAs [operator]) do
     exerciseCmd svc4 Unstake_Batch with
       user          = alice
       smusdCids     = [s1, s2, s3]
@@ -778,18 +768,18 @@ test_Staking_UnstakeBatch_ForfeitMultiStaker = script do
   mA1 <- mintMusd operator alice 100.0
   mA2 <- mintMusd operator alice 100.0
   mB  <- mintMusd operator bob   100.0
-  (svc2, sA1) <- submitMulti [alice] [operator] do
+  (svc2, sA1) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd stakeSvcCid Stake with user = alice; musdCid = mA1
-  (svc3, sA2) <- submitMulti [alice] [operator] do
+  (svc3, sA2) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd svc2 Stake with user = alice; musdCid = mA2
-  (svc4, _sB) <- submitMulti [bob] [operator] do
+  (svc4, _sB) <- submit (actAs bob <> readAs [operator]) do
     exerciseCmd svc3 Stake with user = bob; musdCid = mB
 
   -- Alice provides her 2 tokens (200 shares) but requests only 100 mUSD.
   -- totalSharesProvided (200) < totalShares (300): Bob still holds 100 shares.
   -- Guard does NOT fire; forfeit policy applies: Alice burns 200 shares, gets 100 mUSD.
   -- Forfeited value: ~100 mUSD worth of shares burned with no payout → stays in vault.
-  (svc5, musdOut) <- submitMulti [alice] [operator] do
+  (svc5, musdOut) <- submit (actAs alice <> readAs [operator]) do
     exerciseCmd svc4 Unstake_Batch with
       user          = alice
       smusdCids     = [sA1, sA2]

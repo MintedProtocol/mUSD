@@ -410,16 +410,24 @@ template CantonStakingService
     --   - Exactly `requestedMusd` mUSD is withdrawn from the vault and sent to user
     --   - Service totalShares / pooledMusd updated proportionally
     --
-    -- FORFEIT POLICY (intentional, by design):
+    -- FORFEIT POLICY (intentional, by design — with last-staker exception):
     --   ALL provided smUSD tokens are archived unconditionally, even if
     --   their combined vault value exceeds `requestedMusd`.  The caller receives
     --   exactly `requestedMusd` mUSD; excess shares are burned and the surplus
-    --   mUSD remains in the pool, marginally benefiting remaining stakers.
+    --   mUSD remains in the pool, benefiting remaining stakers.
     --   This is a deliberate protocol-level policy — returning change would
     --   require re-creating smUSD tokens inside the choice (complex, risky).
-    --   Callers MUST ensure they pass the minimal covering set of tokens.
-    --   Use SMUSD_Split to pre-split positions, or use the frontend helper
-    --   `selectTokensForAmount` in canton-balances.ts.
+    --
+    -- EXCEPTION — LAST_STAKER_PARTIAL_FORBIDDEN:
+    --   If the caller is the last staker (consuming all outstanding shares) and
+    --   requests less than the full vault balance, the call is REJECTED.
+    --   Reason: the surplus mUSD would be locked with zero share holders,
+    --   creating an unrecoverable orphaned balance.
+    --   To unstake as last staker, either:
+    --     (a) request the exact vault balance (use pooledMusd as requestedMusd), or
+    --     (b) provide fewer tokens so some shares remain outstanding.
+    --   Callers should pass the minimal covering set; use SMUSD_Split to
+    --   pre-split positions, or use `selectTokensForAmount` in canton-balances.ts.
     choice Unstake_Batch : (ContractId CantonStakingService, ContractId CantonMUSD)
       with
         user          : Party
@@ -456,6 +464,19 @@ template CantonStakingService
 
         assertMsg "INSUFFICIENT_BALANCE" (totalMusdValue >= requestedMusd)
         assertMsg "ZERO_WITHDRAWAL" (requestedMusd > 0.0)
+
+        -- Guard: forbid zero-share residual-vault state (orphaned mUSD).
+        -- If the caller provides ALL outstanding shares (last-staker path) but requests
+        -- only part of the vault, the service would reach totalShares=0 with pooledMusd>0.
+        -- The residual mUSD would be locked in an operator-owned contract with no share
+        -- holders to claim it, making it unrecoverable without an out-of-band operator action.
+        -- Callers must choose one of:
+        --   (a) request the full vault balance (no residual), or
+        --   (b) provide only a subset of tokens so other stakers' shares remain.
+        let willConsumeAllShares = totalSharesProvided >= totalShares
+        let vaultResidual        = pooledMusd - requestedMusd
+        assertMsg "LAST_STAKER_PARTIAL_FORBIDDEN"
+          (not (willConsumeAllShares && vaultResidual > 0.0))
 
         -- Archive all provided smUSD positions
         _ <- mapA archive smusdCids

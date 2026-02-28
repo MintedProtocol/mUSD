@@ -2,15 +2,37 @@
 
 **Package:** `ble-protocol v1.2.0`
 **Branch:** `option2/protocol`
-**Status:** Implemented and tested (17/17 tests pass)
+**Status:** Implemented and tested (18/18 tests pass)
+
+---
+
+## Economic Invariant — Zero-Share Residual Vault
+
+> **Invariant:** `Unstake_Batch` MUST NOT produce a service state where `totalShares == 0` and `pooledMusd > 0`.
+
+Such a state creates an **orphaned vault** — mUSD locked in an operator-owned contract with no outstanding shares to claim it. This mUSD is unrecoverable without an out-of-band operator action and would act as an unexpected windfall for the next staker (who pays share price 1.0 against a non-zero pool).
+
+### Guard: `LAST_STAKER_PARTIAL_FORBIDDEN`
+
+Added to `Unstake_Batch` in `CantonSMUSD.daml`. Fires when:
+- `totalSharesProvided >= totalShares` (caller is burning all outstanding shares), AND
+- `pooledMusd - requestedMusd > 0` (vault would retain residual mUSD)
+
+The call is rejected. Callers must either:
+- **(a)** Request the exact vault balance (`requestedMusd == pooledMusd`)
+- **(b)** Provide fewer tokens so other stakers' shares remain outstanding
+
+Note: This guard applies **only to `Unstake_Batch`** (vault model). `ETHPool_BatchUnstake` mints fresh mUSD on exit with no shared vault, so it has no orphan risk and the forfeit-excess policy applies without restriction.
 
 ---
 
 ## Forfeit Policy — Governance Decision
 
-> **Policy adopted:** FORFEIT-EXCESS (retain-all-archive-exact-pay)
+> **Policy adopted:** FORFEIT-EXCESS (retain-all-archive-exact-pay) — with last-staker guard for vault model
 
-All batch unstake choices (`ETHPool_BatchUnstake`, `Unstake_Batch`) archive ALL provided tokens unconditionally. The caller receives **exactly `requestedMusd`** mUSD. Any excess value in the provided tokens is **forfeited** — not returned to the caller.
+Batch unstake choices archive ALL provided tokens unconditionally. The caller receives **exactly `requestedMusd`** mUSD. Any excess value is forfeited — not returned to the caller.
+
+**Exception:** `Unstake_Batch` applies `LAST_STAKER_PARTIAL_FORBIDDEN` (see above) to prevent orphaned vault state.
 
 ### Rationale
 
@@ -23,15 +45,28 @@ The forfeit-excess model is deliberately simple and safe. It shifts the responsi
 
 ### Caller obligations
 
-- For `ETHPool_BatchUnstake` and `Unstake_Batch`: pass only the minimal set of tokens that covers `requestedMusd`. Use `SMUSDE_Split`/`SMUSD_Split` to pre-split if needed, or use the frontend helper `selectTokensForAmount` in `canton-balances.ts` which selects greedily by descending amount.
+- For `ETHPool_BatchUnstake`: pass only the minimal set of tokens that covers `requestedMusd`. Use `SMUSDE_Split` to pre-split if needed, or use `selectTokensForAmount` in `canton-balances.ts`.
+- For `Unstake_Batch`: same minimal-set obligation, PLUS as last staker you must request the full vault balance or keep shares outstanding.
 - For `Lending_BatchDepositSMUSD`/`Lending_BatchDepositSMUSDE`: all provided tokens are deposited in full — no forfeit, no partial deposit.
+
+### Operator/frontend expectation
+
+Before submitting `Unstake_Batch`, the frontend should detect the last-staker condition:
+```typescript
+// pseudo-code: if user holds all shares, request the full vault amount
+if (userTotalShares >= poolTotalShares) {
+  requestedMusd = pooledMusd;  // avoid LAST_STAKER_PARTIAL_FORBIDDEN
+}
+```
+The `canton-balances.ts` helper `selectTokensForAmount` alone is insufficient for this guard; explicit last-staker detection is required.
 
 ### Tests proving the policy (tests 15 and 16)
 
 | Test | Proves |
 |---|---|
-| `test_ETHPool_BatchUnstake_ForfeitGovPolicy` | User gets exactly `requestedMusd`; all tokens archived; service `totalShares == 0` (all shares burned, not just `requestedMusd/sharePrice`); `currentUnstakeMinted == 150` not 300 |
-| `test_Staking_UnstakeBatch_ForfeitGovPolicy` | User gets exactly `requestedMusd`; all tokens archived; service `totalShares == 0`; vault `pooledMusd == 150` (excess stays in pool) |
+| `test_ETHPool_BatchUnstake_ForfeitGovPolicy` | ETH pool forfeit: user gets exactly `requestedMusd`; all tokens archived; service `totalShares == 0`; `currentUnstakeMinted == 150` (not 300) |
+| `test_Staking_UnstakeBatch_LastStakerPartialForbidden` | Guard fires: last staker partial rejected with `LAST_STAKER_PARTIAL_FORBIDDEN` |
+| `test_Staking_UnstakeBatch_ForfeitMultiStaker` | Multi-staker forfeit valid: Alice burns 200 shares, gets 100 mUSD, Bob's 100 shares remain; vault holds 200 mUSD |
 
 ---
 
@@ -143,9 +178,11 @@ Compliance: `ValidateRedemption` called on `complianceRegistryCid`.
   - `totalShares` reduced by shares consumed
   - `pooledMusd` reduced by `requestedMusd`
 
-### Vault mechanics (FORFEIT POLICY)
+### Vault mechanics (FORFEIT POLICY + LAST_STAKER guard)
 
-Unlike `ETHPool_BatchUnstake`, this choice withdraws from an existing vault (vault-model staking). If the combined value of provided tokens exceeds `requestedMusd`, the excess stays in the vault for remaining stakers — the extra shares are burned, the extra mUSD remains in the pool, slightly increasing the remaining share price. No change is returned to the caller. See [Forfeit Policy](#forfeit-policy--governance-decision). Use `SMUSD_Split` beforehand if exact withdrawal is required.
+Unlike `ETHPool_BatchUnstake`, this choice withdraws from an existing shared vault. If the combined value of provided tokens exceeds `requestedMusd`, the excess stays in the vault for remaining stakers — the extra shares are burned, the extra mUSD remains in the pool. No change is returned to the caller.
+
+**Exception:** If the caller would consume ALL outstanding shares but the vault would retain residual mUSD, the call is rejected with `LAST_STAKER_PARTIAL_FORBIDDEN`. See [Economic Invariant](#economic-invariant--zero-share-residual-vault). Use `SMUSD_Split` to pre-split positions if exact partial withdrawal is needed while keeping shares outstanding.
 
 ---
 
@@ -277,12 +314,12 @@ All abort codes surface as `FAILED_PRECONDITION` gRPC status with the abort mess
 
 ## Test Coverage
 
-**File:** `BatchChoicesTest.daml` — 17 tests, all passing.
+**File:** `BatchChoicesTest.daml` — 18 tests total (17 `test_*` functions + `setupParties`), all passing.
 
 | # | Test | Choice |
 |---|---|---|
 | 1 | `test_ETHPool_BatchUnstake_HappyPath` | 3 positions → 300 mUSD |
-| 2 | `test_Staking_UnstakeBatch_HappyPath` | 3 positions → 300 mUSD from vault |
+| 2 | `test_Staking_UnstakeBatch_HappyPath` | 3 positions → 300 mUSD from vault (last-staker full, guard passes) |
 | 3 | `test_Lending_BatchDepositSMUSD_HappyPath` | 2 smUSD → single escrow |
 | 4 | `test_Lending_BatchDepositSMUSDE_HappyPath` | 2 smUSD-E → single escrow |
 | 5 | `test_ETHPool_BatchUnstake_InsufficientBalance` | 150 requested from 100 total → INSUFFICIENT_BALANCE |
@@ -295,9 +332,10 @@ All abort codes surface as `FAILED_PRECONDITION` gRPC status with the abort mess
 | 12 | `test_Staking_UnstakeBatch_EmptyList` | Empty list → NO_POSITIONS_PROVIDED |
 | 13 | `test_Lending_BatchDepositSMUSD_Idempotency` | Second deposit adds to existing escrow |
 | 14 | `test_ETHPool_BatchUnstake_PartialRequest` | 3 positions (300 total), request 150 → 150 mUSD, all 3 archived |
-| 15 | `test_ETHPool_BatchUnstake_ForfeitGovPolicy` | FORFEIT POLICY proof for ETH pool: user gets exactly requestedMusd, all shares burned |
-| 16 | `test_Staking_UnstakeBatch_ForfeitGovPolicy` | FORFEIT POLICY proof for vault: user gets exactly requestedMusd, excess stays in vault |
-| 17 | `setupParties` | Helper (allocates parties, creates registry) |
+| 15 | `test_ETHPool_BatchUnstake_ForfeitGovPolicy` | FORFEIT POLICY proof for ETH pool: user gets exactly requestedMusd, all shares burned, currentUnstakeMinted == 150 |
+| 16 | `test_Staking_UnstakeBatch_LastStakerPartialForbidden` | Guard proof: last staker partial rejected → `LAST_STAKER_PARTIAL_FORBIDDEN` |
+| 17 | `test_Staking_UnstakeBatch_ForfeitMultiStaker` | Valid forfeit: 2-staker pool, Alice burns 200 shares, gets 100 mUSD, Bob's 100 shares persist |
+| 18 | `setupParties` | Helper (allocates parties, creates compliance registry) |
 
 ---
 
